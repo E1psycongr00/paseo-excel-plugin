@@ -225,11 +225,10 @@ function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowH
       {layout.print.estimated && preview ? (
         <Text style={styles.notice} numberOfLines={1}>자동 페이지 나누기(점선)는 추정값이라 실제 인쇄와 한두 줄 다를 수 있습니다.</Text>
       ) : null}
-      {compact && details}
+      {details}
       <View style={{ flex: 1 }}>
         <Grid file={fileKey} meta={meta} layout={layout} options={options} selected={selected} onSelect={select} onZoomWheel={compact ? undefined : onZoomWheel} bottomClearance={compact && Platform.OS !== "web" ? NATIVE_BOTTOM_CLEARANCE : 0} />
       </View>
-      {!compact && details}
     </View>
   );
 }
@@ -251,7 +250,7 @@ function CellDetails({ meta, layout, fileKey, selected, theme, compact, onClose 
   const link = layout.links.find((entry) => entry.r === r && entry.c === c);
   const address = `${columnLabel(c)}${r + 1}${selected[2] !== r || selected[3] !== c ? `:${columnLabel(selected[3])}${selected[2] + 1}` : ""}`;
   return (
-    <View style={[styles.details, compact ? styles.detailsTop : styles.detailsBottom]}>
+    <View style={styles.details}>
       <View style={styles.detailsRow}>
         <Text style={styles.address}>{address}</Text>
         <Text style={styles.value} selectable numberOfLines={compact ? 3 : 2}>{cell?.v || "(빈 셀)"}</Text>
@@ -305,9 +304,7 @@ function chrome(theme: PluginTheme, compact: boolean) {
     tabTextActive: { color: c.foreground, fontWeight: "600" as const },
     tabHidden: { fontStyle: "italic" as const },
     tabNote: { color: c.foregroundMuted, fontSize: 11, paddingHorizontal: 8 },
-    details: { paddingHorizontal: pad + 2, paddingVertical: 6, gap: 3, borderColor: c.border, backgroundColor: c.surface1 },
-    detailsTop: { borderBottomWidth: 1 },
-    detailsBottom: { borderTopWidth: 1 },
+    details: { paddingHorizontal: pad + 2, paddingVertical: 6, gap: 3, borderBottomWidth: 1, borderColor: c.border, backgroundColor: c.surface1 },
     detailsRow: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: 10 },
     address: { color: c.foregroundMuted, fontSize: 13, fontWeight: "600" as const, minWidth: 48 },
     value: { flex: 1, color: c.foreground, fontSize: 13 },
