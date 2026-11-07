@@ -179,6 +179,13 @@ export function parseXlsx(bytes: Uint8Array, revision: string): ParsedWorkbook {
       parsedSheets.set(index, parsed);
       return parsed;
     },
+    sheetBytes(index) {
+      if (parsedSheets.has(index)) return 0;
+      const part = sheets[index]?.part;
+      if (!part) return 0;
+      const entry = files[part] ?? files[Object.keys(files).find((name) => name.toLowerCase() === part.toLowerCase()) ?? ""];
+      return entry?.length ?? 0;
+    },
     image(key) {
       const part = imageParts.get(key);
       if (!part) return null;

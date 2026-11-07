@@ -1,14 +1,19 @@
 import { readFile, realpath, stat } from "node:fs/promises";
 import { extname, isAbsolute, relative, sep } from "node:path";
 import { IMAGE_CHUNK_BYTES, STALE_REVISION } from "../shared/rpc";
-import type { CellChunk } from "../shared/model";
-import { cellsInRows } from "./sheet-builder";
+import { type CellChunk, initialSheet, type OpenResult, type SheetBundle } from "../shared/model";
+import { cellsInRows, type ParsedSheet } from "./sheet-builder";
 import type { ParsedWorkbook } from "./workbook";
 import { parseXls } from "./xls/index";
 import { parseXlsx } from "./xlsx/index";
 
 const MAX_FILE_BYTES = 300 * 1024 * 1024;
 const CACHE_SIZE = 6;
+/** Rows below the saved top row that a bundle covers: a tall phone screen at small zoom. */
+const FIRST_SCREEN_ROWS = 60;
+// Parsing blocks the daemon's only thread, so a background prefetch must not stall the sheet on
+// screen: about 150ms of parsing for either format.
+const PREFETCH_MAX_BYTES = 4 * 1024 * 1024;
 
 interface Entry {
   revision: string;
@@ -74,21 +79,51 @@ async function current(path: string, revision: string): Promise<Entry> {
   return entry;
 }
 
-export async function openWorkbook(path: string) {
-  const entry = await loadWorkbook(path);
-  return { json: JSON.stringify(entry.workbook.meta) };
+function chunk(parsed: ParsedSheet, rowStart: number, rowEnd: number): CellChunk {
+  return { sheet: parsed.layout.index, rowStart, rowEnd, cells: cellsInRows(parsed, rowStart, rowEnd) };
 }
 
-export async function sheetLayout(path: string, revision: string, sheet: number) {
+/** Layout plus the chunks (on the app's chunk grid) under the saved top rows and frozen rows. */
+export function sheetBundle(parsed: ParsedSheet): SheetBundle {
+  const { layout } = parsed;
+  const size = layout.chunkRows;
+  const lastRow = Math.min(layout.lastRow, layout.rowCount - 1);
+  const indexes = new Set<number>();
+  if (lastRow >= 0) {
+    if (layout.view.frozenRows > 0) indexes.add(0);
+    const top = Math.min(layout.view.topRow, lastRow);
+    const bottom = Math.min(lastRow, layout.view.topRow + FIRST_SCREEN_ROWS);
+    for (let i = Math.floor(top / size); i <= Math.floor(bottom / size); i++) indexes.add(i);
+  }
+  const chunks = [...indexes].sort((a, b) => a - b).map((i) => chunk(parsed, i * size, (i + 1) * size));
+  return { layout, chunks };
+}
+
+export async function openWorkbook(path: string, requested?: number) {
+  const entry = await loadWorkbook(path);
+  const { meta } = entry.workbook;
+  let initial: SheetBundle | null = null;
+  if (meta.sheets.length > 0) {
+    // A sheet that fails to parse still opens the workbook; its own request then shows the error.
+    try {
+      initial = sheetBundle(entry.workbook.sheet(initialSheet(meta, requested)));
+    } catch (error) {
+      console.error(`[excel-viewer] first sheet failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  const result: OpenResult = { meta, initial };
+  return { json: JSON.stringify(result) };
+}
+
+export async function sheetOpen(path: string, revision: string, sheet: number, prefetch: boolean) {
   const entry = await current(path, revision);
-  return { json: JSON.stringify(entry.workbook.sheet(sheet).layout) };
+  if (prefetch && entry.workbook.sheetBytes(sheet) > PREFETCH_MAX_BYTES) return { json: "null" };
+  return { json: JSON.stringify(sheetBundle(entry.workbook.sheet(sheet))) };
 }
 
 export async function sheetCells(path: string, revision: string, sheet: number, rowStart: number, rowEnd: number) {
   const entry = await current(path, revision);
-  const parsed = entry.workbook.sheet(sheet);
-  const chunk: CellChunk = { sheet, rowStart, rowEnd, cells: cellsInRows(parsed, rowStart, rowEnd) };
-  return { json: JSON.stringify(chunk) };
+  return { json: JSON.stringify(chunk(entry.workbook.sheet(sheet), rowStart, rowEnd)) };
 }
 
 export async function imageChunk(path: string, revision: string, key: string, index: number) {

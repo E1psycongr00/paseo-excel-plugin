@@ -1,8 +1,8 @@
 import { useRpc } from "@getpaseo/plugin/client";
-import { useQueries, useQuery } from "@tanstack/react-query";
-import { useMemo } from "react";
-import type { CellChunk, SheetLayout, WorkbookMeta } from "../shared/model";
-import { imageChunkRpc, sheetCellsRpc, sheetLayoutRpc, workbookOpenRpc } from "../shared/rpc";
+import { type QueryClient, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef } from "react";
+import type { CellChunk, OpenResult, SheetBundle, SheetLayout, WorkbookMeta } from "../shared/model";
+import { imageChunkRpc, sheetCellsRpc, sheetOpenRpc, workbookOpenRpc } from "../shared/rpc";
 import { indexCells, type RowCells } from "./geometry";
 
 export interface FileKey {
@@ -10,25 +10,90 @@ export interface FileKey {
   path: string;
 }
 
-export function useWorkbook(file: FileKey, version: number) {
+const layoutKey = (file: FileKey, revision: string | undefined, sheet: number) => ["excel.layout", file.workspaceId, file.path, revision, sheet];
+const cellsKey = (file: FileKey, revision: string | undefined, sheet: number | undefined, chunk: number) =>
+  ["excel.cells", file.workspaceId, file.path, revision, sheet, chunk];
+
+/** Puts a bundle's layout and cell chunks where the sheet's own queries look, so they skip the network. */
+function seedSheet(client: QueryClient, file: FileKey, revision: string, bundle: SheetBundle) {
+  const { layout } = bundle;
+  if (client.getQueryData(layoutKey(file, revision, layout.index)) === undefined) client.setQueryData(layoutKey(file, revision, layout.index), layout);
+  for (const chunk of bundle.chunks) {
+    const key = cellsKey(file, revision, layout.index, Math.floor(chunk.rowStart / layout.chunkRows));
+    if (client.getQueryData(key) === undefined) client.setQueryData(key, chunk);
+  }
+}
+
+/** Opens the workbook; the response also carries the first sheet's layout and first-screen cells. */
+export function useWorkbook(file: FileKey, version: number, savedSheet: number | undefined) {
   const open = useRpc(workbookOpenRpc);
+  const client = useQueryClient();
   return useQuery({
+    // The saved sheet only picks what comes bundled, so it stays out of the key.
     queryKey: ["excel.open", file.workspaceId, file.path, version],
-    queryFn: async () => JSON.parse((await open(file)).json) as WorkbookMeta,
+    queryFn: async () => {
+      const result = JSON.parse((await open({ ...file, ...(savedSheet !== undefined ? { sheet: savedSheet } : {}) })).json) as OpenResult;
+      if (result.initial) seedSheet(client, file, result.meta.revision, result.initial);
+      return result.meta;
+    },
     staleTime: Infinity,
     retry: 1,
   });
 }
 
 export function useSheetLayout(file: FileKey, revision: string | undefined, sheet: number) {
-  const layout = useRpc(sheetLayoutRpc);
+  const open = useRpc(sheetOpenRpc);
+  const client = useQueryClient();
   return useQuery({
-    queryKey: ["excel.layout", file.workspaceId, file.path, revision, sheet],
-    queryFn: async () => JSON.parse((await layout({ ...file, revision: revision!, sheet })).json) as SheetLayout,
+    queryKey: layoutKey(file, revision, sheet),
+    queryFn: async () => {
+      const bundle = JSON.parse((await open({ ...file, revision: revision!, sheet, prefetch: false })).json) as SheetBundle;
+      seedSheet(client, file, revision!, bundle);
+      return bundle.layout;
+    },
     enabled: revision !== undefined,
     staleTime: Infinity,
     retry: 1,
   });
+}
+
+/** Wait after the current sheet is up before fetching others, so its own scroll-ahead goes first. */
+const PREFETCH_DELAY_MS = 1000;
+
+/**
+ * Fetches the other visible sheets' first screens one at a time, nearest tab first, so tapping a tab
+ * shows it at once. The daemon declines sheets too large to parse in the background.
+ */
+export function usePrefetchSheets(file: FileKey, meta: WorkbookMeta, current: number, ready: boolean) {
+  const open = useRpc(sheetOpenRpc);
+  const openRef = useRef(open);
+  openRef.current = open;
+  const client = useQueryClient();
+  useEffect(() => {
+    if (!ready) return;
+    let cancelled = false;
+    const order = meta.sheets
+      .filter((sheet) => sheet.state === "visible" && sheet.index !== current)
+      .map((sheet) => sheet.index)
+      .sort((a, b) => Math.abs(a - current) - Math.abs(b - current) || a - b);
+    const timer = setTimeout(async () => {
+      for (const sheet of order) {
+        if (cancelled) return;
+        if (client.getQueryData(layoutKey(file, meta.revision, sheet)) !== undefined) continue;
+        try {
+          const bundle = JSON.parse((await openRef.current({ ...file, revision: meta.revision, sheet, prefetch: true })).json) as SheetBundle | null;
+          if (!cancelled && bundle) seedSheet(client, file, meta.revision, bundle);
+        } catch {
+          // Stale file or lost connection: stop quietly; the sheet's own request reports errors.
+          return;
+        }
+      }
+    }, PREFETCH_DELAY_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [ready, file, meta, current, client]);
 }
 
 // One index per received chunk, so a row's Map keeps its identity while other chunks come and go;
@@ -60,7 +125,7 @@ export function useCellRows(file: FileKey, revision: string | undefined, layout:
   }
   const results = useQueries({
     queries: chunks.map((index) => ({
-      queryKey: ["excel.cells", file.workspaceId, file.path, revision, layout?.index, index],
+      queryKey: cellsKey(file, revision, layout?.index, index),
       queryFn: async () => {
         const rowStartChunk = index * chunkRows;
         const response = await cells({ ...file, revision: revision!, sheet: layout!.index, rowStart: rowStartChunk, rowEnd: rowStartChunk + chunkRows });
