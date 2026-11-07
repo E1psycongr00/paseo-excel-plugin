@@ -213,3 +213,22 @@ export interface CellChunk {
   rowEnd: number;
   cells: Cell[];
 }
+
+/** A sheet's layout with the cell chunks its first screen needs. */
+export interface SheetBundle {
+  layout: SheetLayout;
+  chunks: CellChunk[];
+}
+
+export interface OpenResult {
+  meta: WorkbookMeta;
+  /** Bundle for `initialSheet(meta, requested)`; absent when that sheet failed to parse. */
+  initial: SheetBundle | null;
+}
+
+/** Sheet a tab opens on: the saved one, else the active sheet if visible, else the first visible. */
+export function initialSheet(meta: WorkbookMeta, saved: number | undefined): number {
+  if (saved !== undefined && saved < meta.sheets.length) return saved;
+  if (meta.sheets[meta.activeSheet]?.state === "visible") return meta.activeSheet;
+  return meta.sheets.find((sheet) => sheet.state === "visible")?.index ?? 0;
+}

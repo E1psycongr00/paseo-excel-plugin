@@ -3,9 +3,9 @@ import type { PluginFilePanelProps } from "@getpaseo/plugin/client";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Platform, Pressable, ScrollView, Text, View } from "react-native";
-import type { Range, SheetLayout, WorkbookMeta } from "../shared/model";
+import { initialSheet, type Range, type SheetLayout, type WorkbookMeta } from "../shared/model";
 import { STALE_REVISION } from "../shared/rpc";
-import { useCellRows, useSheetLayout, useWorkbook } from "./data";
+import { useCellRows, usePrefetchSheets, useSheetLayout, useWorkbook } from "./data";
 import { columnLabel, Grid, type GridOptions } from "./grid";
 import { openExternal } from "./web";
 
@@ -38,7 +38,7 @@ export function ExcelFilePanel({ file, workspaceId, theme, layout, tab }: Plugin
   useEffect(() => file.watch((event) => {
     if (event.type === "changed") setVersion((value) => value + 1);
   }), [file]);
-  const workbook = useWorkbook(fileKey, version);
+  const workbook = useWorkbook(fileKey, version, readTabState(tab.state).sheet);
 
   // A stale revision means the file changed between requests: reopen it.
   const retryStale = useCallback((error: unknown) => {
@@ -85,10 +85,8 @@ interface WorkbookViewProps {
 function WorkbookView({ meta, fileKey, theme, compact, tab, onStale }: WorkbookViewProps) {
   const styles = useMemo(() => chrome(theme, compact), [theme, compact]);
   const saved = readTabState(tab.state);
-  const firstVisible = meta.sheets.find((sheet) => sheet.state === "visible")?.index ?? 0;
-  const initial = saved.sheet !== undefined && saved.sheet < meta.sheets.length ? saved.sheet
-    : meta.sheets[meta.activeSheet]?.state === "visible" ? meta.activeSheet : firstVisible;
-  const [sheet, setSheet] = useState(initial);
+  // Same choice as the daemon's, so the sheet that came bundled with the open is the one shown.
+  const [sheet, setSheet] = useState(() => initialSheet(meta, saved.sheet));
   const [showHidden, setShowHidden] = useState(false);
   const selectSheet = (index: number) => {
     setSheet(index);
@@ -98,6 +96,7 @@ function WorkbookView({ meta, fileKey, theme, compact, tab, onStale }: WorkbookV
   useEffect(() => {
     if (layoutQuery.error) onStale(layoutQuery.error);
   }, [layoutQuery.error, onStale]);
+  usePrefetchSheets(fileKey, meta, sheet, layoutQuery.data !== undefined);
 
   const hiddenSheets = meta.sheets.filter((entry) => entry.state !== "visible").length;
   const tabBar = (

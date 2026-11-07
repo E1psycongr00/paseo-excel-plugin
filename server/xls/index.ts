@@ -93,6 +93,14 @@ export function parseXls(bytes: Uint8Array, revision: string): ParsedWorkbook {
       parsed.set(index, sheet);
       return sheet;
     },
+    sheetBytes(index) {
+      const info = worksheets[index];
+      if (!info || parsed.has(index)) return 0;
+      // A substream runs to the next sheet's BOF (or the end of the stream).
+      let end = stream.length;
+      for (const other of globals.sheets) if (other.offset > info.offset && other.offset < end) end = other.offset;
+      return end - info.offset;
+    },
     image(key) {
       const blip = imageKeys.get(key);
       return blip === undefined ? null : globals.blips[blip] ?? null;

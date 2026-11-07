@@ -10,6 +10,8 @@ export interface ImageData {
 export interface ParsedWorkbook {
   meta: WorkbookMeta;
   sheet(index: number): ParsedSheet;
+  /** Bytes a sheet's parse would read, or 0 once parsed. Bounds background prefetch. */
+  sheetBytes(index: number): number;
   image(key: string): ImageData | null;
 }
 

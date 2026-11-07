@@ -1,6 +1,6 @@
 import type { PluginHandlerContext, PluginServerContext } from "@getpaseo/plugin/server";
-import { imageChunk, openWorkbook, resolveWorkspaceFile, sheetCells, sheetLayout } from "./server/service";
-import { imageChunkRpc, sheetCellsRpc, sheetLayoutRpc, workbookOpenRpc } from "./shared/rpc";
+import { imageChunk, openWorkbook, resolveWorkspaceFile, sheetCells, sheetOpen } from "./server/service";
+import { imageChunkRpc, sheetCellsRpc, sheetOpenRpc, workbookOpenRpc } from "./shared/rpc";
 
 // Re-checking the workspace lists workspaces over IPC; doing it every 30s stalled cell requests while
 // scrolling. Concurrent requests for the same file share one check.
@@ -22,9 +22,9 @@ function resolve(paseo: PluginHandlerContext["paseo"], workspaceId: string, path
 }
 
 export default function contribute(server: PluginServerContext) {
-  server.handle(workbookOpenRpc, async ({ workspaceId, path }, { paseo }) => openWorkbook(await resolve(paseo, workspaceId, path)));
-  server.handle(sheetLayoutRpc, async ({ workspaceId, path, revision, sheet }, { paseo }) =>
-    sheetLayout(await resolve(paseo, workspaceId, path), revision, sheet));
+  server.handle(workbookOpenRpc, async ({ workspaceId, path, sheet }, { paseo }) => openWorkbook(await resolve(paseo, workspaceId, path), sheet));
+  server.handle(sheetOpenRpc, async ({ workspaceId, path, revision, sheet, prefetch }, { paseo }) =>
+    sheetOpen(await resolve(paseo, workspaceId, path), revision, sheet, prefetch));
   server.handle(sheetCellsRpc, async ({ workspaceId, path, revision, sheet, rowStart, rowEnd }, { paseo }) =>
     sheetCells(await resolve(paseo, workspaceId, path), revision, sheet, rowStart, rowEnd));
   server.handle(imageChunkRpc, async ({ workspaceId, path, revision, key, index }, { paseo }) =>

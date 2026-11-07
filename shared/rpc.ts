@@ -8,15 +8,27 @@ const fileRef = {
   path: z.string(),
 };
 
+/**
+ * Returns an `OpenResult`: the workbook meta plus the first sheet's layout and first-screen cells,
+ * so a phone over the relay waits for one round trip instead of three.
+ */
 export const workbookOpenRpc = defineRpc({
   name: "excel.workbook.open",
-  input: z.object(fileRef),
+  input: z.object({
+    ...fileRef,
+    /** Sheet the tab showed last time; the daemon falls back like `initialSheet`. */
+    sheet: z.number().int().min(0).optional(),
+  }),
   output: z.object({ json: z.string() }),
 });
 
-export const sheetLayoutRpc = defineRpc({
-  name: "excel.sheet.layout",
-  input: z.object({ ...fileRef, revision: z.string(), sheet: z.number().int().min(0) }),
+/**
+ * Returns a `SheetBundle` (layout plus first-screen cells), or `null` for a prefetch of a sheet
+ * too large to parse in the background.
+ */
+export const sheetOpenRpc = defineRpc({
+  name: "excel.sheet.open",
+  input: z.object({ ...fileRef, revision: z.string(), sheet: z.number().int().min(0), prefetch: z.boolean() }),
   output: z.object({ json: z.string() }),
 });
 
