@@ -1,0 +1,40 @@
+{
+  "name": "excel-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "files": [
+    "paseo-plugin.json",
+    "OVERVIEW.md",
+    "OVERVIEW.*.md",
+    "index.client.ts",
+    "index.client.tsx",
+    "index.server.ts",
+    "index.server.tsx",
+    "client/",
+    "server/",
+    "shared/"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "oracle": "pwsh -NoProfile -File tools/excel-oracle.ps1"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.15.3",
+    "@tanstack/react-query": "^5.90.11",
+    "@types/node": "^26.6.6",
+    "@types/react": "~19.2.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.0",
+    "zod": "^4.4.3"
+  },
+  "dependencies": {
+    "cfb": "^1.2.2",
+    "fflate": "^0.8.3",
+    "ssf": "^0.11.2"
+  },
+  "description": "Excel workbook viewer for Paseo file tabs."
+}

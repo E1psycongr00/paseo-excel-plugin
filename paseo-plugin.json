@@ -1,0 +1,8 @@
+{
+  "id": "excel-viewer",
+  "name": "Excel viewer",
+  "description": "View .xlsx and .xls workbooks with their formatting, merged cells, hidden rows and sheets, formula results, images, comments and page break preview.",
+  "requirements": {
+    "paseo": ">=0.15.3"
+  }
+}

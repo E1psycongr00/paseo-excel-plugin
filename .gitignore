@@ -1,0 +1,8 @@
+node_modules/
+.tmp/
+# Personal data: the user-provided sample and everything derived from it
+fixtures/sample-career.*
+fixtures/oracle/sample-career.*
+# Regenerate with tools/make-large.ps1
+fixtures/large-*
+fixtures/oracle/*.pdf
