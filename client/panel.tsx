@@ -100,7 +100,7 @@ function WorkbookView({ meta, fileKey, theme, compact, tab, onStale }: WorkbookV
 
   const hiddenSheets = meta.sheets.filter((entry) => entry.state !== "visible").length;
   const tabBar = (
-    <View style={[styles.tabs, compact ? styles.tabsTop : styles.tabsBottom]}>
+    <View style={styles.tabs}>
       <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ alignItems: "stretch" }}>
         {meta.sheets.map((entry) => {
           if (entry.state !== "visible" && !showHidden) return null;
@@ -127,7 +127,7 @@ function WorkbookView({ meta, fileKey, theme, compact, tab, onStale }: WorkbookV
   );
   return (
     <View style={styles.root}>
-      {compact ? tabBar : null}
+      {tabBar}
       {layoutQuery.data ? (
         <SheetView key={`${sheet}`} meta={meta} layout={layoutQuery.data} fileKey={fileKey} theme={theme} compact={compact} showHidden={showHidden} setShowHidden={setShowHidden} />
       ) : layoutQuery.error ? (
@@ -142,7 +142,6 @@ function WorkbookView({ meta, fileKey, theme, compact, tab, onStale }: WorkbookV
           <ActivityIndicator color={theme.colors.accent} />
         </View>
       )}
-      {compact ? null : tabBar}
     </View>
   );
 }
@@ -295,9 +294,7 @@ function chrome(theme: PluginTheme, compact: boolean) {
     toolTextActive: { color: c.accentForeground },
     zoomLabel: { paddingHorizontal: 4, paddingVertical: compact ? 8 : 5, minWidth: 48, alignItems: "center" as const },
     notice: { color: c.foregroundMuted, fontSize: 11, paddingHorizontal: pad, paddingVertical: 3, backgroundColor: c.surface1 },
-    tabs: { flexDirection: "row" as const, alignItems: "center" as const, minHeight: compact ? 44 : 34, borderColor: c.border, backgroundColor: c.surface1 },
-    tabsTop: { borderBottomWidth: 1 },
-    tabsBottom: { borderTopWidth: 1 },
+    tabs: { flexDirection: "row" as const, alignItems: "center" as const, minHeight: compact ? 44 : 34, borderBottomWidth: 1, borderColor: c.border, backgroundColor: c.surface1 },
     tab: { paddingHorizontal: compact ? 14 : 12, justifyContent: "center" as const, minHeight: compact ? 44 : 34, borderRightWidth: 1, borderColor: c.border, maxWidth: 220 },
     tabActive: { backgroundColor: c.surface0 },
     tabText: { color: c.foregroundMuted, fontSize: 13 },
