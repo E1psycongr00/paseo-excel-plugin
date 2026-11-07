@@ -25,6 +25,8 @@ export interface GridOptions {
   preview: boolean;
   showGrid: boolean;
   showHeaders: boolean;
+  /** Temporary: single-view text for cells that clearly fit, to compare with the wrapped drawing. */
+  slimText: boolean;
 }
 
 interface GridProps {
@@ -38,6 +40,16 @@ interface GridProps {
   /** Extra scroll room below the last row, for content the host draws system bars over. */
   bottomClearance?: number;
 }
+
+/** Rows loaded beyond the window on each side, so the next chunk is on the device before it scrolls in. */
+const PREFETCH_ROWS = 150;
+// After scrolling stops, the window grows in steps (half a screen of rows and a quarter screen of
+// columns per side each step), so the next scroll starts over tiles that are already drawn.
+const IDLE_DELAY_MS = 200;
+const IDLE_STEP_MS = 150;
+const IDLE_STEPS = 2;
+
+const contains = (a: Window, b: Window) => a.r0 <= b.r0 && a.r1 >= b.r1 && a.c0 <= b.c0 && a.c1 >= b.c1;
 
 const HEADER_BG = "#F3F3F3";
 const HEADER_TEXT = "#444444";
@@ -56,7 +68,7 @@ export function columnLabel(c: number): string {
 }
 
 export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWheel, bottomClearance = 0 }: GridProps) {
-  const { zoom, showHidden, preview, showGrid, showHeaders } = options;
+  const { zoom, showHidden, preview, showGrid, showHeaders, slimText } = options;
   const { rows, cols, findCol, rowMap } = useMemo(() => buildAxes(layout, zoom, showHidden), [layout, zoom, showHidden]);
   const merges = useMemo(() => new Merges(layout.merges), [layout.merges]);
   const styles = useMemo(() => new StyleCache(meta.styles, zoom), [meta.styles, zoom]);
@@ -81,20 +93,52 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
   const [win, setWin] = useState<Window>({ r0: 0, r1: 40, c0: 0, c1: 20 });
   const [viewRect, setViewRect] = useState({ x: 0, y: 0, w: 0, h: 0 });
 
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const windowAxes = useRef<unknown>(null);
+  const windowCols = useRef<unknown>(null);
   const update = useCallback((x: number, y: number) => {
     scroll.current = { x, y };
-    scrollX.setValue(x);
-    scrollY.setValue(y);
-    const next = visibleWindow(rows, cols, x, y, Math.max(1, viewport.width), Math.max(1, viewport.height));
-    setWin((current) => (sameWindow(current, next) ? current : next));
+    // Native scroll views drive these values on the UI thread (see nativeScroll); setting them from
+    // JS there would pull the headers back to a stale offset.
+    if (isWeb) {
+      scrollX.setValue(x);
+      scrollY.setValue(y);
+    }
+    const width = Math.max(1, viewport.width);
+    const height = Math.max(1, viewport.height);
+    const windowAt = (step: number) => {
+      const mx = step * width * 0.25;
+      const my = step * height * 0.5;
+      return visibleWindow(rows, cols, Math.max(0, x - mx), Math.max(0, y - my), width + mx * 2, height + my * 2);
+    };
+    // A window drawn for other axes (zoom, hidden toggle, resize) is replaced; otherwise a larger
+    // window that still covers the screen is kept, so pre-drawn tiles survive small scrolls.
+    const sameAxes = windowAxes.current === rows && windowCols.current === cols;
+    windowAxes.current = rows;
+    windowCols.current = cols;
+    const next = windowAt(0);
+    setWin((current) => (sameWindow(current, next) || (sameAxes && contains(current, next)) ? current : next));
     setViewRect((current) => (Math.abs(current.x - x) > 200 || Math.abs(current.y - y) > 200 || current.w !== viewport.width ? { x, y, w: viewport.width, h: viewport.height } : current));
+
+    if (idleTimer.current) clearTimeout(idleTimer.current);
+    let step = 0;
+    const grow = () => {
+      step++;
+      const wider = windowAt(step);
+      setWin((current) => (contains(current, wider) ? current : wider));
+      idleTimer.current = step < IDLE_STEPS ? setTimeout(grow, IDLE_STEP_MS) : null;
+    };
+    idleTimer.current = setTimeout(grow, IDLE_DELAY_MS);
   }, [rows, cols, viewport.width, viewport.height, scrollX, scrollY]);
 
   useEffect(() => {
     update(scroll.current.x, scroll.current.y);
   }, [update]);
+  useEffect(() => () => {
+    if (idleTimer.current) clearTimeout(idleTimer.current);
+  }, []);
 
-  const { rows: cells } = useCellRows(file, meta.revision, layout, win.r0, win.r1);
+  const { rows: cells } = useCellRows(file, meta.revision, layout, win.r0, win.r1, PREFETCH_ROWS);
   const { rows: frozenCells } = useCellRows(file, meta.revision, layout, 0, frozenRows > 0 ? frozenRows - 1 : -1);
   const allCells = useMemo(() => {
     if (frozenRows === 0) return cells;
@@ -143,10 +187,20 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     anchor.current = { r: rows.indexAt(scroll.current.y + frozenH), c: cols.indexAt(scroll.current.x + frozenW) };
   });
 
-  const onScroll = (axis: "x" | "y" | "xy") => (event: NativeSyntheticEvent<NativeScrollEvent>) => {
-    const { x, y } = event.nativeEvent.contentOffset;
-    update(axis === "y" ? scroll.current.x : x, axis === "x" ? scroll.current.y : y);
-  };
+  // Frozen panes and headers follow the scroll on the UI thread; the JS listener only moves the window.
+  const updateRef = useRef(update);
+  updateRef.current = update;
+  const nativeScroll = useMemo(() => {
+    const listener = (axis: "x" | "y" | "xy") => (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const { x, y } = event.nativeEvent.contentOffset;
+      updateRef.current(axis === "y" ? scroll.current.x : x, axis === "x" ? scroll.current.y : y);
+    };
+    return {
+      x: Animated.event([{ nativeEvent: { contentOffset: { x: scrollX } } }], { useNativeDriver: true, listener: listener("x") }),
+      y: Animated.event([{ nativeEvent: { contentOffset: { y: scrollY } } }], { useNativeDriver: true, listener: listener("y") }),
+      xy: Animated.event([{ nativeEvent: { contentOffset: { x: scrollX, y: scrollY } } }], { useNativeDriver: true, listener: listener("xy") }),
+    };
+  }, [scrollX, scrollY]);
 
   const onLayout = (event: LayoutChangeEvent) => {
     const { width, height } = event.nativeEvent.layout;
@@ -171,8 +225,11 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
 
   const totalW = cols.total;
   const totalH = rows.total;
-  const layerBase = { layout, rows, cols, cells: allCells, merges, styles, zoom, showGrid, showHidden, rowStyle, colStyle, comments, selected };
-  const mainWin: Window = { r0: Math.max(win.r0, frozenRows), r1: win.r1, c0: Math.max(win.c0, frozenCols), c1: win.c1 };
+  const layerBase = { layout, rows, cols, cells: allCells, merges, styles, zoom, showGrid, showHidden, rowStyle, colStyle, comments, selected, slimText };
+  const mainWin = useMemo<Window>(() => ({ r0: Math.max(win.r0, frozenRows), r1: win.r1, c0: Math.max(win.c0, frozenCols), c1: win.c1 }), [win, frozenRows, frozenCols]);
+  const topWin = useMemo<Window>(() => ({ r0: 0, r1: frozenRows - 1, c0: Math.max(win.c0, frozenCols), c1: win.c1 }), [win.c0, win.c1, frozenRows, frozenCols]);
+  const sideWin = useMemo<Window>(() => ({ r0: Math.max(win.r0, frozenRows), r1: win.r1, c0: 0, c1: frozenCols - 1 }), [win.r0, win.r1, frozenRows, frozenCols]);
+  const cornerWin = useMemo<Window>(() => ({ r0: 0, r1: frozenRows - 1, c0: 0, c1: frozenCols - 1 }), [frozenRows, frozenCols]);
 
   const content = (
     <View style={{ width: totalW, height: totalH, backgroundColor: "#FFFFFF" }}>
@@ -191,25 +248,25 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     );
   } else if (Platform.OS === "android") {
     scroller = (
-      <ScrollView ref={outer} style={{ position: "absolute", left: headerW, top: headerH, right: 0, bottom: 0 }} nestedScrollEnabled onScroll={onScroll("y")} scrollEventThrottle={16}>
-        <ScrollView ref={inner} horizontal nestedScrollEnabled onScroll={onScroll("x")} scrollEventThrottle={16}>
+      <Animated.ScrollView ref={outer} style={{ position: "absolute", left: headerW, top: headerH, right: 0, bottom: 0 }} nestedScrollEnabled onScroll={nativeScroll.y} scrollEventThrottle={16}>
+        <Animated.ScrollView ref={inner} horizontal nestedScrollEnabled onScroll={nativeScroll.x} scrollEventThrottle={16}>
           {content}
-        </ScrollView>
+        </Animated.ScrollView>
         {bottomClearance > 0 ? <View style={{ height: bottomClearance }} /> : null}
-      </ScrollView>
+      </Animated.ScrollView>
     );
   } else {
     scroller = (
-      <ScrollView
+      <Animated.ScrollView
         ref={outer}
         style={{ position: "absolute", left: headerW, top: headerH, right: 0, bottom: 0 }}
         contentContainerStyle={{ width: totalW, height: totalH + bottomClearance }}
         directionalLockEnabled={false}
-        onScroll={onScroll("xy")}
+        onScroll={nativeScroll.xy}
         scrollEventThrottle={16}
       >
         {content}
-      </ScrollView>
+      </Animated.ScrollView>
     );
   }
 
@@ -255,7 +312,7 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
         {frozenRows > 0 ? (
           <View pointerEvents="none" style={{ position: "absolute", top: headerH, left: headerW + frozenW, right: 0, height: frozenH, overflow: "hidden", borderBottomWidth: 1, borderColor: bandLine, backgroundColor: "#FFFFFF" }}>
             <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: frozenH, transform: [{ translateX: negX }] }}>
-              <SheetLayer {...layerBase} win={{ r0: 0, r1: frozenRows - 1, c0: Math.max(win.c0, frozenCols), c1: win.c1 }} ox={frozenW} oy={0} />
+              <SheetLayer {...layerBase} win={topWin} ox={frozenW} oy={0} />
             </Animated.View>
           </View>
         ) : null}
@@ -263,13 +320,13 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
         {frozenCols > 0 ? (
           <View pointerEvents="none" style={{ position: "absolute", top: headerH + frozenH, left: headerW, bottom: 0, width: frozenW, overflow: "hidden", borderRightWidth: 1, borderColor: bandLine, backgroundColor: "#FFFFFF" }}>
             <Animated.View style={{ position: "absolute", left: 0, top: 0, width: frozenW, height: totalH, transform: [{ translateY: negY }] }}>
-              <SheetLayer {...layerBase} win={{ r0: Math.max(win.r0, frozenRows), r1: win.r1, c0: 0, c1: frozenCols - 1 }} ox={0} oy={frozenH} />
+              <SheetLayer {...layerBase} win={sideWin} ox={0} oy={frozenH} />
             </Animated.View>
           </View>
         ) : null}
         {frozenRows > 0 && frozenCols > 0 ? (
           <View pointerEvents="none" style={{ position: "absolute", top: headerH, left: headerW, width: frozenW, height: frozenH, overflow: "hidden", borderRightWidth: 1, borderBottomWidth: 1, borderColor: bandLine, backgroundColor: "#FFFFFF" }}>
-            <SheetLayer {...layerBase} win={{ r0: 0, r1: frozenRows - 1, c0: 0, c1: frozenCols - 1 }} ox={0} oy={0} />
+            <SheetLayer {...layerBase} win={cornerWin} ox={0} oy={0} />
           </View>
         ) : null}
 

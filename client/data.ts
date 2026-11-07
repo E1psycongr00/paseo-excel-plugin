@@ -31,15 +31,31 @@ export function useSheetLayout(file: FileKey, revision: string | undefined, shee
   });
 }
 
-/** Loads the row chunks covering [rowStart, rowEnd] and indexes their cells. */
-export function useCellRows(file: FileKey, revision: string | undefined, layout: SheetLayout | undefined, rowStart: number, rowEnd: number) {
+// One index per received chunk, so a row's Map keeps its identity while other chunks come and go;
+// drawn tiles compare row Maps to know whether they can be reused.
+const chunkIndex = new WeakMap<CellChunk, RowCells>();
+
+function indexChunk(chunk: CellChunk): RowCells {
+  let index = chunkIndex.get(chunk);
+  if (!index) {
+    index = indexCells(chunk.cells);
+    chunkIndex.set(chunk, index);
+  }
+  return index;
+}
+
+/**
+ * Loads the row chunks covering [rowStart, rowEnd] and indexes their cells. `ahead` rows on both
+ * sides load too, so scrolling reaches rows that are already on the device.
+ */
+export function useCellRows(file: FileKey, revision: string | undefined, layout: SheetLayout | undefined, rowStart: number, rowEnd: number, ahead = 0) {
   const cells = useRpc(sheetCellsRpc);
   const chunkRows = layout?.chunkRows ?? 400;
   const lastRow = layout ? Math.min(layout.lastRow, layout.rowCount - 1) : -1;
   const chunks: number[] = [];
-  if (layout && lastRow >= 0) {
-    const first = Math.floor(Math.max(0, rowStart) / chunkRows);
-    const last = Math.floor(Math.min(lastRow, Math.max(rowStart, rowEnd)) / chunkRows);
+  if (layout && lastRow >= 0 && rowEnd >= rowStart) {
+    const first = Math.floor(Math.max(0, rowStart - ahead) / chunkRows);
+    const last = Math.floor(Math.min(lastRow, rowEnd + ahead) / chunkRows);
     for (let i = first; i <= last; i++) chunks.push(i);
   }
   const results = useQueries({
@@ -58,7 +74,10 @@ export function useCellRows(file: FileKey, revision: string | undefined, layout:
   const stamp = results.map((result) => result.dataUpdatedAt).join(",");
   const rows = useMemo<RowCells>(() => {
     const index: RowCells = new Map();
-    for (const result of results) if (result.data) indexCells(result.data.cells, index);
+    for (const result of results) {
+      if (!result.data) continue;
+      for (const [r, row] of indexChunk(result.data)) index.set(r, row);
+    }
     return index;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [stamp]);

@@ -1,12 +1,18 @@
-import { memo, type ReactElement } from "react";
+import { Fragment, memo, useRef, type ReactElement } from "react";
 import { Text, View, type TextStyle } from "react-native";
 import type { BorderSide, Cell, CellComment, CellStyle, Range, SheetLayout } from "../shared/model";
 import { type StyleCache, runStyle } from "./cell-style";
-import { type Axis, effectiveAlign, estimateTextWidth, type Merges, overflowSpan, type RowCells, type Window } from "./geometry";
+import { type Axis, effectiveAlign, estimateTextWidth, type Merges, overflowSpan, type RowCells, type Tile, type Window, windowTiles } from "./geometry";
 
 export const GRID_COLOR = "#D9D9D9";
 export const SELECT_COLOR = "#217346";
 const BIG = 4000;
+/** Columns a text cell may spill across on each side. */
+const SPILL_COLS = 20;
+/** Text drawn without a clipping wrapper must be estimated at most this share of its box. */
+const SLIM_FIT = 0.8;
+/** Added to the estimated text width before choosing spill columns (the estimate already leans wide). */
+const SPILL_SLACK_PX = 2;
 
 export interface LayerProps {
   layout: SheetLayout;
@@ -26,6 +32,8 @@ export interface LayerProps {
   colStyle: (c: number) => number | null;
   comments: Map<number, CellComment>;
   selected: Range | null;
+  /** Single-view text for cells that clearly fit (temporary toggle to compare against the wrapper). */
+  slimText: boolean;
 }
 
 const key = (r: number, c: number) => r * 16384 + c;
@@ -156,6 +164,20 @@ function cellText(id: string, cell: Cell, style: CellStyle | undefined, box: Tex
   }
 
   const inner = box.w - pad * 2 - indent;
+
+  // One native view instead of two for plain single-line text that clearly fits its box: the wrapper's
+  // clip, flex alignment and wide-text trick do nothing then, so the same position is computed here.
+  // Anything that could overflow, wrap, rotate, mix fonts or not fit the row height keeps the wrapper.
+  const lineHeight = (fontScale !== 1 ? Math.ceil(fontPx * fontScale * 1.22) : (base.lineHeight as number | undefined)) ?? Math.ceil(fontPx * 1.22);
+  if (props.slimText && !wrap && !cell.rich && box.h >= lineHeight && estimateTextWidth(text, fontPx * fontScale) <= inner * SLIM_FIT) {
+    const top = vertical === "flex-start" ? box.y : vertical === "center" ? box.y + (box.h - lineHeight) / 2 : box.y + box.h - lineHeight;
+    const slot = align === "center" ? { left: box.x, width: box.w } : { left: box.x + pad + (align === "left" ? indent : 0), width: Math.max(1, inner) };
+    out.push(
+      <Text key={id} numberOfLines={1} ellipsizeMode="clip" style={[...textStyle, { position: "absolute", top, ...slot }]}>{text}</Text>,
+    );
+    return;
+  }
+
   let marginLeft: number;
   let width: number;
   if (wrap) {
@@ -172,27 +194,57 @@ function cellText(id: string, cell: Cell, style: CellStyle | undefined, box: Tex
   );
 }
 
-function SheetLayerImpl(props: LayerProps) {
-  const { layout, rows, cols, win, ox, oy, cells, merges, styles, zoom, showGrid, showHidden, comments, selected } = props;
-  const grid: ReactElement[] = [];
-  const blanks: ReactElement[] = [];
-  const fills: ReactElement[] = [];
-  const texts: ReactElement[] = [];
-  const borders: ReactElement[] = [];
-  const marks: ReactElement[] = [];
+interface TileLayers {
+  grid: ReactElement[];
+  blanks: ReactElement[];
+  fills: ReactElement[];
+  texts: ReactElement[];
+  borders: ReactElement[];
+  marks: ReactElement[];
+}
 
-  const left = cols.start(win.c0) - ox;
-  const top = rows.start(win.r0) - oy;
-  const right = cols.end(win.c1) - ox;
-  const bottom = rows.end(win.r1) - oy;
+interface CachedTile {
+  key: string;
+  deps: unknown[];
+  /** Row Maps the tile read; a different Map (or a newly loaded row) means the tile is stale. */
+  reads: Map<number, Map<number, Cell> | undefined>;
+  layers: TileLayers;
+}
+
+/** Everything a tile depends on except cells, which are checked per row through `reads`. */
+function tileDeps(props: LayerProps): unknown[] {
+  return [props.layout, props.rows, props.cols, props.merges, props.styles, props.zoom, props.showGrid, props.showHidden, props.rowStyle, props.colStyle, props.comments, props.ox, props.oy, props.slimText];
+}
+
+function sameDeps(a: unknown[], b: unknown[]): boolean {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function drawTile(props: LayerProps, tile: Tile): { reads: CachedTile["reads"]; layers: TileLayers } {
+  const { rows, cols, ox, oy, cells, merges, styles, zoom, showGrid, showHidden, comments } = props;
+  const reads: CachedTile["reads"] = new Map();
+  const rowCells = (r: number) => {
+    if (reads.has(r)) return reads.get(r);
+    const row = cells.get(r);
+    reads.set(r, row);
+    return row;
+  };
+  const layers: TileLayers = { grid: [], blanks: [], fills: [], texts: [], borders: [], marks: [] };
+  const { grid, blanks, fills, texts, borders, marks } = layers;
+
+  const left = cols.start(tile.c0) - ox;
+  const top = rows.start(tile.r0) - oy;
+  const right = cols.end(tile.c1) - ox;
+  const bottom = rows.end(tile.r1) - oy;
 
   if (showGrid) {
-    for (let c = win.c0; c <= win.c1 + 1; c++) {
-      if (c <= win.c1 && cols.size(c) === 0) continue;
+    for (let c = tile.c0; c <= tile.c1 + 1; c++) {
+      if (c <= tile.c1 && cols.size(c) === 0) continue;
       grid.push(<View key={`gc${c}`} style={{ position: "absolute", left: cols.start(c) - ox, top, width: 1, height: bottom - top, backgroundColor: GRID_COLOR }} />);
     }
-    for (let r = win.r0; r <= win.r1 + 1; r++) {
-      if (r <= win.r1 && rows.size(r) === 0) continue;
+    for (let r = tile.r0; r <= tile.r1 + 1; r++) {
+      if (r <= tile.r1 && rows.size(r) === 0) continue;
       grid.push(<View key={`gr${r}`} style={{ position: "absolute", left, top: rows.start(r) - oy, width: right - left, height: 1, backgroundColor: GRID_COLOR }} />);
     }
   }
@@ -219,11 +271,11 @@ function SheetLayerImpl(props: LayerProps) {
     }
   };
 
-  for (let r = win.r0; r <= win.r1; r++) {
+  for (let r = tile.r0; r <= tile.r1; r++) {
     const h = rows.size(r);
     if (h === 0) continue;
-    const row = cells.get(r);
-    for (let c = win.c0; c <= win.c1; c++) {
+    const row = rowCells(r);
+    for (let c = tile.c0; c <= tile.c1; c++) {
       const w = cols.size(c);
       if (w === 0) continue;
       const cell = row?.get(c);
@@ -237,7 +289,11 @@ function SheetLayerImpl(props: LayerProps) {
       const y = rows.start(r) - oy;
       if (style?.fill) fills.push(<View key={`f${r}_${c}`} style={{ position: "absolute", left: x, top: y, width: w, height: h, backgroundColor: style.fill }} />);
       if (cell && cell.v) {
-        const [first, last] = overflowSpan(cell, style, row, merges, { c0: Math.max(0, win.c0 - 20), c1: win.c1 + 20 });
+        // The spill limit follows the cell, not the window, so a cached tile stays correct. The span ends
+        // where the text does (estimated, plus a little slack), so gridlines past it stay visible as in Excel.
+        const fontPx = (styles.text(cell.s, cell.fc).fontSize as number | undefined) ?? 14;
+        const need = estimateTextWidth(cell.v, fontPx) + SPILL_SLACK_PX + Math.max(1, 2 * zoom) * 2 + (style?.indent ?? 0) * 9 * zoom;
+        const [first, last] = overflowSpan(cell, style, row, merges, { c0: Math.max(0, c - SPILL_COLS), c1: c + SPILL_COLS }, { width: need, cols });
         const sx = cols.start(first) - ox;
         const sw = cols.end(last) - cols.start(first);
         if ((first !== c || last !== c) && showGrid) {
@@ -251,14 +307,14 @@ function SheetLayerImpl(props: LayerProps) {
     }
   }
 
-  for (const merge of merges.intersecting(win)) {
+  for (const merge of merges.ownedBy(tile)) {
     const [r1, c1, r2, c2] = merge;
     const x = cols.start(c1) - ox;
     const y = rows.start(r1) - oy;
     const w = cols.end(c2) - cols.start(c1);
     const h = rows.end(r2) - rows.start(r1);
     if (w <= 0 || h <= 0) continue;
-    const cell = cells.get(r1)?.get(c1);
+    const cell = rowCells(r1)?.get(c1);
     const style = styles.get(styleAt(r1, c1, cell));
     fills.push(<View key={`mf${r1}_${c1}`} style={{ position: "absolute", left: x + (showGrid ? 1 : 0), top: y + (showGrid ? 1 : 0), width: w - (showGrid ? 1 : 0), height: h - (showGrid ? 1 : 0), backgroundColor: style?.fill ?? "#FFFFFF" }} />);
     if (cell && cell.v) cellText(`mt${r1}_${c1}`, cell, style, { x, y, w, h, cellW: w }, props, texts);
@@ -267,34 +323,66 @@ function SheetLayerImpl(props: LayerProps) {
   }
 
   if (showHidden) {
-    for (let r = win.r0; r <= win.r1; r++) {
+    for (let r = tile.r0; r <= tile.r1; r++) {
       if (rows.hidden[r]) marks.push(<View key={`hr${r}`} pointerEvents="none" style={{ position: "absolute", left, top: rows.start(r) - oy, width: right - left, height: rows.size(r), backgroundColor: "rgba(120,120,120,0.18)" }} />);
     }
-    for (let c = win.c0; c <= win.c1; c++) {
+    for (let c = tile.c0; c <= tile.c1; c++) {
       if (cols.hidden[c]) marks.push(<View key={`hc${c}`} pointerEvents="none" style={{ position: "absolute", left: cols.start(c) - ox, top, width: cols.size(c), height: bottom - top, backgroundColor: "rgba(120,120,120,0.18)" }} />);
     }
   }
+  return { reads, layers };
+}
 
+const LAYER_ORDER: (keyof TileLayers)[] = ["grid", "blanks", "fills", "texts", "borders", "marks"];
+
+/**
+ * Draws the window as cached tiles. Scrolling one block draws only the tiles that came into view;
+ * the rest reuse their elements, which React skips without touching native views. Layers stay in
+ * the same order as one big layer, so a tile's fills never cover a neighbour's spilled text.
+ */
+function SheetLayerImpl(props: LayerProps) {
+  const { rows, cols, win, ox, oy, cells, selected } = props;
+  const cache = useRef(new Map<string, CachedTile>());
+  const deps = tileDeps(props);
+  const tiles: CachedTile[] = [];
+  const next = new Map<string, CachedTile>();
+  for (const tile of windowTiles(win)) {
+    const id = `${tile.r0}_${tile.r1}_${tile.c0}_${tile.c1}${tile.top ? "t" : ""}${tile.left ? "l" : ""}`;
+    let entry = cache.current.get(id);
+    let fresh = !!entry && sameDeps(entry.deps, deps);
+    if (entry && fresh) {
+      for (const [r, row] of entry.reads) {
+        if (cells.get(r) !== row) {
+          fresh = false;
+          break;
+        }
+      }
+    }
+    if (!entry || !fresh) entry = { key: id, deps, ...drawTile(props, tile) };
+    next.set(id, entry);
+    tiles.push(entry);
+  }
+  cache.current = next;
+
+  let selection: ReactElement | null = null;
   if (selected && selected[2] >= win.r0 && selected[0] <= win.r1 && selected[3] >= win.c0 && selected[1] <= win.c1) {
     const x = cols.start(selected[1]) - ox;
     const y = rows.start(selected[0]) - oy;
-    marks.push(
+    selection = (
       <View
-        key="sel"
         pointerEvents="none"
         style={{ position: "absolute", left: x - 1, top: y - 1, width: cols.end(selected[3]) - cols.start(selected[1]) + 2, height: rows.end(selected[2]) - rows.start(selected[0]) + 2, borderWidth: 2, borderColor: SELECT_COLOR }}
-      />,
+      />
     );
   }
-  void layout;
   return (
     <>
-      {grid}
-      {blanks}
-      {fills}
-      {texts}
-      {borders}
-      {marks}
+      {LAYER_ORDER.map((layer) => (
+        <Fragment key={layer}>
+          {tiles.map((tile) => <Fragment key={tile.key}>{tile.layers[layer]}</Fragment>)}
+        </Fragment>
+      ))}
+      {selection}
     </>
   );
 }

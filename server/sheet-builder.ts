@@ -32,7 +32,8 @@ export interface ParsedSheet {
   finalize: (cell: Cell) => void;
 }
 
-const CHUNK_ROWS = 400;
+// About 100KB of JSON for a dozen filled columns: small enough to arrive quickly on a phone.
+const CHUNK_ROWS = 200;
 const PAD_ROWS = 40;
 const PAD_COLS = 8;
 const MIN_ROWS = 60;

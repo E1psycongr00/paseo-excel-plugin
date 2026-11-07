@@ -1,6 +1,6 @@
 import { strToU8, zipSync } from "fflate";
 import { describe, expect, it } from "vitest";
-import { Axis, effectiveAlign, Merges, overflowSpan, visibleWindow } from "../client/geometry";
+import { Axis, effectiveAlign, estimateTextWidth, Merges, overflowSpan, visibleWindow, windowTiles } from "../client/geometry";
 import { applyTint, resolveColor, DEFAULT_PALETTE, DEFAULT_THEME } from "../server/colors";
 import { formatColor, formatValue } from "../server/format";
 import { computePages } from "../server/pages";
@@ -9,7 +9,7 @@ import { columnWidthPx, defaultColumnPx } from "../server/units";
 import { rk } from "../server/xls/reader";
 import { scanXml } from "../server/xml";
 import { unzipLimited } from "../server/xlsx/zip";
-import type { Cell } from "../shared/model";
+import type { Cell, CellStyle } from "../shared/model";
 
 describe("references", () => {
   it("parses cells, ranges and defined-name areas", () => {
@@ -93,6 +93,45 @@ describe("grid geometry", () => {
     const row = new Map<number, Cell>([[0, cell], [3, { r: 0, c: 3, s: 0, v: "x", k: "s" }]]);
     expect(overflowSpan(cell, undefined, row, new Merges([]), { c0: 0, c1: 9 })).toEqual([0, 2]);
     expect(effectiveAlign(undefined, { ...cell, k: "n" })).toBe("right");
+  });
+
+  it("ends a spill where the text ends", () => {
+    const cols = new Axis(30, () => 64, () => false, 1);
+    const cell: Cell = { r: 0, c: 0, s: 0, v: "long text", k: "s" };
+    const row = new Map<number, Cell>([[0, cell]]);
+    const span = (width: number, style?: Partial<CellStyle>, at = cell) =>
+      overflowSpan(at, style as CellStyle | undefined, row, new Merges([]), { c0: 0, c1: 20 }, { width, cols });
+    expect(span(150)).toEqual([0, 2]);
+    expect(span(60)).toEqual([0, 0]);
+    const centered: Cell = { ...cell, c: 10 };
+    row.set(10, centered);
+    expect(span(64 * 3, { h: "center" }, centered)).toEqual([9, 11]);
+  });
+
+  it("estimates separators narrower than digits", () => {
+    // Excel shows 15,000.00 in a 74px column at 11pt; the "####" check allows 70px.
+    expect(estimateTextWidth("15,000.00", (11 * 96) / 72)).toBeLessThanOrEqual(70);
+    expect(estimateTextWidth("가나다", 10)).toBe(30);
+  });
+
+  it("splits a window into block-aligned tiles that cover it once", () => {
+    const win = { r0: 1, r1: 40, c0: 3, c1: 13 };
+    const tiles = windowTiles(win);
+    expect(tiles[0]).toEqual({ r0: 1, r1: 15, c0: 3, c1: 5, top: true, left: true });
+    let area = 0;
+    for (const tile of tiles) area += (tile.r1 - tile.r0 + 1) * (tile.c1 - tile.c0 + 1);
+    expect(area).toBe(40 * 11);
+    expect(windowTiles({ r0: 0, r1: -1, c0: 0, c1: 5 })).toEqual([]);
+  });
+
+  it("draws each merge in exactly one tile, even when it starts outside the window", () => {
+    const merges = new Merges([[0, 0, 20, 2], [5, 4, 5, 9], [30, 7, 33, 8], [2, 14, 3, 15]]);
+    const tiles = windowTiles({ r0: 16, r1: 47, c0: 0, c1: 11 });
+    const owners = (index: number) => tiles.filter((tile) => merges.ownedBy(tile).includes(merges.list[index]!)).length;
+    expect(owners(0)).toBe(1); // starts above the window
+    expect(owners(1)).toBe(0); // entirely above
+    expect(owners(2)).toBe(1); // inside
+    expect(owners(3)).toBe(0); // right of and above the window
   });
 });
 

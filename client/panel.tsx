@@ -176,8 +176,12 @@ function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowH
   const [zoom, setZoom] = useState<number | null>(null);
   const [preview, setPreview] = useState(layout.view.mode === "pageBreakPreview");
   const [selected, setSelected] = useState<Range | null>(null);
+  // Temporary comparison toggle for the single-view text drawing; remove once checked against Excel.
+  const [slimText, setSlimText] = useState(true);
   const savedZoom = Math.max(0.1, Math.min(4, layout.view.zoom / 100));
-  const effectiveZoom = zoom ?? (width === 0 ? savedZoom : compact ? Math.min(savedZoom, fitZoom(layout, width)) : savedZoom);
+  // Phones open at the saved zoom like desktop; fitting every column made text tiny and put more cells
+  // on screen. The zoom label toggles fit-to-width.
+  const effectiveZoom = zoom ?? savedZoom;
 
   const stepZoom = (direction: 1 | -1) => {
     const current = effectiveZoom;
@@ -197,6 +201,7 @@ function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowH
     preview,
     showGrid: layout.view.showGrid,
     showHeaders: layout.view.showHeaders && !(compact && width < 360),
+    slimText,
   };
   const select = useCallback((r: number, c: number) => {
     const merge = layout.merges.find((m) => m[0] === r && m[1] === c);
@@ -210,6 +215,7 @@ function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowH
       <View style={styles.toolbar}>
         <ToolButton theme={theme} styles={styles} label={preview ? "페이지 미리 보기" : "기본 보기"} active={preview} onPress={() => setPreview(!preview)} hint="페이지 나누기 미리 보기 전환" />
         <ToolButton theme={theme} styles={styles} label={showHidden ? "숨김 표시 중" : hiddenCount > 0 ? `숨김 ${hiddenCount}` : "숨김"} active={showHidden} onPress={() => setShowHidden(!showHidden)} hint="숨긴 행, 열, 시트 표시" />
+        <ToolButton theme={theme} styles={styles} label={slimText ? "새 글자" : "기존 글자"} active={slimText} onPress={() => setSlimText(!slimText)} hint="셀 글자 그리기 방식 전환 (비교용)" />
         <View style={styles.spacer} />
         <ToolButton theme={theme} styles={styles} label="−" onPress={() => stepZoom(-1)} hint="축소" />
         <Pressable accessibilityRole="button" accessibilityLabel="화면에 맞추기" onPress={() => setZoom(zoom === null ? fitZoom(layout, width) : null)} style={styles.zoomLabel}>
