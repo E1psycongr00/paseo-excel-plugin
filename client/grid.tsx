@@ -14,9 +14,9 @@ import {
 import type { CellComment, Range, SheetLayout, WorkbookMeta } from "../shared/model";
 import { StyleCache } from "./cell-style";
 import { type FileKey, useCellRows } from "./data";
-import { buildAxes, Merges, sameWindow, visibleWindow, type Window } from "./geometry";
+import { type Axis, buildAxes, hiddenRuns, Merges, openedMask, type Reveal, sameWindow, visibleWindow, type Window } from "./geometry";
 import { Drawings, Pages } from "./overlays";
-import { GRID_COLOR, SELECT_COLOR, SheetLayer } from "./sheet-layer";
+import { FOLD_COLOR, folded, GRID_COLOR, LITE_ROW_PX, SELECT_COLOR, SheetLayer } from "./sheet-layer";
 import { attachWebScroll, isWeb, webScrollTo } from "./web";
 
 export interface GridOptions {
@@ -27,6 +27,8 @@ export interface GridOptions {
   showHeaders: boolean;
   /** Temporary: single-view text for cells that clearly fit, to compare with the wrapped drawing. */
   slimText: boolean;
+  /** Quick review: plain values on uniform rows, without formatting, pictures or page breaks. */
+  lite: boolean;
 }
 
 interface GridProps {
@@ -37,6 +39,8 @@ interface GridProps {
   selected: Range | null;
   onSelect(r: number, c: number): void;
   onZoomWheel?(delta: number): void;
+  /** Zoom chosen with a two-finger pinch on phones. */
+  onZoomTo?(zoom: number): void;
   /** Extra scroll room below the last row, for content the host draws system bars over. */
   bottomClearance?: number;
 }
@@ -49,12 +53,72 @@ const IDLE_DELAY_MS = 200;
 const IDLE_STEP_MS = 150;
 const IDLE_STEPS = 2;
 
+export const MIN_ZOOM = 0.25;
+export const MAX_ZOOM = 3;
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
+
+/** Finger distance and midpoint, in page px. */
+interface Touch2 {
+  dist: number;
+  mx: number;
+  my: number;
+}
+
+interface Pinch {
+  /** Fingers when the zoom on screen was taken; the preview transform is measured from here. */
+  base: Touch2;
+  last: Touch2;
+  /** Fingers of a zoom step that is not on screen yet. */
+  inFlight: Touch2 | null;
+  ended: boolean;
+}
+
+function twoTouches(event: GestureResponderEvent): Touch2 | null {
+  const touches = event.nativeEvent.touches;
+  if (touches.length < 2) return null;
+  const a = touches[0]!;
+  const b = touches[1]!;
+  return { dist: Math.max(1, Math.hypot(a.pageX - b.pageX, a.pageY - b.pageY)), mx: (a.pageX + b.pageX) / 2, my: (a.pageY + b.pageY) / 2 };
+}
+
 const contains = (a: Window, b: Window) => a.r0 <= b.r0 && a.r1 >= b.r1 && a.c0 <= b.c0 && a.c1 >= b.c1;
 
 const HEADER_BG = "#F3F3F3";
 const HEADER_TEXT = "#444444";
 const HEADER_LINE = "#D0D0D0";
 const HEADER_ACTIVE = "#D3E7DA";
+const HEADER_HIDDEN = "#E4E4E4";
+/** How far from a fold marker a header tap still hits it, in px. */
+const FOLD_HIT_PX = 12;
+
+interface Opened {
+  rows: ReadonlySet<number>;
+  cols: ReadonlySet<number>;
+}
+
+const NOTHING_OPENED: Opened = { rows: new Set(), cols: new Set() };
+
+/**
+ * What a header tap at `offset` toggles: the folded run whose marker is nearest (within reach), else
+ * the opened hidden run under the tap. Returns the run's first index.
+ */
+function foldTarget(axis: Axis, runs: Map<number, number>, opened: ReadonlySet<number>, offset: number, reach: number): number | null {
+  let best: number | null = null;
+  let bestDistance = reach;
+  for (const start of runs.keys()) {
+    if (opened.has(start)) continue;
+    const distance = Math.abs(axis.start(start) - offset);
+    if (distance <= bestDistance) {
+      best = start;
+      bestDistance = distance;
+    }
+  }
+  if (best !== null) return best;
+  const index = axis.indexAt(offset);
+  if (!axis.hidden[index] || axis.size(index) === 0) return null;
+  for (const [start, end] of runs) if (index >= start && index <= end && opened.has(start)) return start;
+  return null;
+}
 
 export function columnLabel(c: number): string {
   let name = "";
@@ -67,9 +131,28 @@ export function columnLabel(c: number): string {
   return name;
 }
 
-export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWheel, bottomClearance = 0 }: GridProps) {
-  const { zoom, showHidden, preview, showGrid, showHeaders, slimText } = options;
-  const { rows, cols, findCol, rowMap } = useMemo(() => buildAxes(layout, zoom, showHidden), [layout, zoom, showHidden]);
+export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWheel, onZoomTo, bottomClearance = 0 }: GridProps) {
+  const { zoom, showHidden, preview, showGrid, showHeaders, slimText, lite } = options;
+  // Hidden rows and columns open run by run from their header markers; "숨김" opens them all.
+  const hiddenAxes = useMemo(() => buildAxes(layout, 1, false), [layout]);
+  const rowRuns = useMemo(() => hiddenRuns(hiddenAxes.rows.hidden), [hiddenAxes]);
+  const colRuns = useMemo(() => hiddenRuns(hiddenAxes.cols.hidden), [hiddenAxes]);
+  const [opened, setOpened] = useState<Opened>(NOTHING_OPENED);
+  const reveal = useMemo<boolean | Reveal>(() => {
+    if (showHidden) return true;
+    if (opened.rows.size === 0 && opened.cols.size === 0) return false;
+    const rowMask = openedMask(hiddenAxes.rows.count, rowRuns, opened.rows);
+    const colMask = openedMask(hiddenAxes.cols.count, colRuns, opened.cols);
+    return { row: (r) => rowMask[r] === 1, col: (c) => colMask[c] === 1 };
+  }, [showHidden, opened, hiddenAxes, rowRuns, colRuns]);
+  const toggleFold = useCallback((axis: "rows" | "cols", start: number) => {
+    setOpened((current) => {
+      const next = new Set(current[axis]);
+      if (!next.delete(start)) next.add(start);
+      return { ...current, [axis]: next };
+    });
+  }, []);
+  const { rows, cols, findCol, rowMap } = useMemo(() => buildAxes(layout, zoom, reveal, lite ? LITE_ROW_PX : undefined), [layout, zoom, reveal, lite]);
   const merges = useMemo(() => new Merges(layout.merges), [layout.merges]);
   const styles = useMemo(() => new StyleCache(meta.styles, zoom), [meta.styles, zoom]);
   const comments = useMemo(() => new Map<number, CellComment>(layout.comments.map((note) => [note.r * 16384 + note.c, note])), [layout.comments]);
@@ -172,6 +255,17 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
   const initialized = useRef(false);
   useEffect(() => {
     if (viewport.width === 0) return;
+    const pending = pendingScroll.current;
+    if (pending) {
+      // A pinch step chose this zoom: keep the pinched spot under the fingers.
+      pendingScroll.current = null;
+      initialized.current = true;
+      requestAnimationFrame(() => {
+        scrollTo(pending.x, pending.y);
+        pinchLanded();
+      });
+      return;
+    }
     let target = anchor.current;
     if (!initialized.current) {
       initialized.current = true;
@@ -202,20 +296,145 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     };
   }, [scrollX, scrollY]);
 
+  const area = useRef<View>(null);
+  const areaBox = useRef({ x: 0, y: 0, width: 0, height: 0 });
+  const measureArea = () => area.current?.measureInWindow((x, y, width, height) => {
+    areaBox.current = { x, y, width, height };
+  });
   const onLayout = (event: LayoutChangeEvent) => {
     const { width, height } = event.nativeEvent.layout;
     setViewport({ width: Math.max(0, width - headerW), height: Math.max(0, height - headerH) });
+    measureArea();
   };
 
-  const area = useRef<View>(null);
+  // Two-finger pinch zooms and pans on phones. While the fingers move, the drawn screen is only scaled
+  // and moved (nothing re-renders); on release the zoom is applied once and the scroll keeps the pinched
+  // spot under the fingers. Applying it mid-gesture too made the screen shake at every step, because
+  // the redrawn sheet and the reset preview do not reach the screen in the same frame.
+  const pinchEnabled = !isWeb && onZoomTo !== undefined;
+  const pinch = useRef<Pinch | null>(null);
+  const pendingScroll = useRef<{ x: number; y: number } | null>(null);
+  const [pinching, setPinching] = useState(false);
+  const pinchScale = useRef(new Animated.Value(1)).current;
+  const pinchX = useRef(new Animated.Value(0)).current;
+  const pinchY = useRef(new Animated.Value(0)).current;
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const resetPinch = useCallback(() => {
+    pinchScale.setValue(1);
+    pinchX.setValue(0);
+    pinchY.setValue(0);
+  }, [pinchScale, pinchX, pinchY]);
+  /** Scale of `touch` against `base` at the zoom on screen, within the zoom limits. */
+  const pinchScaleOf = (base: Touch2, touch: Touch2) => clamp((zoomRef.current * touch.dist) / base.dist, MIN_ZOOM, MAX_ZOOM) / zoomRef.current;
+  const showPinch = (base: Touch2, touch: Touch2) => {
+    const scale = pinchScaleOf(base, touch);
+    const box = areaBox.current;
+    // Transforms scale about the view's centre: shift so the base midpoint stays put, then follow the fingers.
+    pinchScale.setValue(scale);
+    pinchX.setValue((base.mx - box.x - box.width / 2) * (1 - scale) + touch.mx - base.mx);
+    pinchY.setValue((base.my - box.y - box.height / 2) * (1 - scale) + touch.my - base.my);
+  };
+  /** Applies the gesture so far as real zoom and scroll; the preview transform restarts from here. */
+  const pinchStep = (current: Pinch) => {
+    const { base, last } = current;
+    const z = zoomRef.current;
+    const next = clamp(Math.round(z * pinchScaleOf(base, last) * 100) / 100, MIN_ZOOM, MAX_ZOOM);
+    const k = next / z;
+    // The content point under the base midpoint lands under the latest midpoint.
+    const box = areaBox.current;
+    const fx = base.mx - box.x - headerW;
+    const fy = base.my - box.y - headerH;
+    const dx = last.mx - base.mx;
+    const dy = last.my - base.my;
+    const x = clamp((scroll.current.x + fx) * k - (fx + dx), 0, Math.max(0, cols.total * k - viewport.width));
+    const y = clamp((scroll.current.y + fy) * k - (fy + dy), 0, Math.max(0, rows.total * k - viewport.height + bottomClearance));
+    if (next === z) {
+      scrollTo(x, y);
+      current.base = last;
+      if (current.ended) {
+        pinch.current = null;
+        resetPinch();
+      } else showPinch(current.base, current.last);
+      return;
+    }
+    current.inFlight = last;
+    pendingScroll.current = { x, y };
+    onZoomTo?.(next);
+  };
+  /** A zoom step is on screen: measure the preview from where that step was taken. */
+  const pinchLanded = () => {
+    const current = pinch.current;
+    if (!current || !current.inFlight) {
+      resetPinch();
+      return;
+    }
+    current.base = current.inFlight;
+    current.inFlight = null;
+    if (current.ended) pinchStep(current);
+    else showPinch(current.base, current.last);
+  };
+  const wantsPinch = (event: GestureResponderEvent) => event.nativeEvent.touches.length >= 2;
+  const startPinch = (event: GestureResponderEvent) => {
+    const touch = twoTouches(event);
+    if (!touch || pinch.current) return;
+    measureArea();
+    pinch.current = { base: touch, last: touch, inFlight: null, ended: false };
+    setPinching(true);
+  };
+  const movePinch = (event: GestureResponderEvent) => {
+    const touch = twoTouches(event);
+    if (!touch) return;
+    const current = pinch.current;
+    if (!current || current.ended) {
+      if (!current) startPinch(event);
+      return;
+    }
+    current.last = touch;
+    showPinch(current.base, touch);
+  };
+  const endPinch = () => {
+    const current = pinch.current;
+    setPinching(false);
+    if (!current) {
+      resetPinch();
+      return;
+    }
+    current.ended = true;
+    // With a step still on its way, the last one runs when it lands.
+    if (!current.inFlight) pinchStep(current);
+  };
+  const pinchHandlers = pinchEnabled
+    ? {
+      onStartShouldSetResponderCapture: wantsPinch,
+      onMoveShouldSetResponderCapture: wantsPinch,
+      // Returning true keeps the native scroll views from taking the gesture back.
+      onResponderGrant: (event: GestureResponderEvent) => {
+        startPinch(event);
+        return true;
+      },
+      onResponderMove: movePinch,
+      onResponderRelease: endPinch,
+      onResponderTerminate: endPinch,
+      onResponderTerminationRequest: () => false,
+    }
+    : {};
   const press = (event: GestureResponderEvent) => {
     const { pageX, pageY } = event.nativeEvent;
     area.current?.measureInWindow((ax, ay) => {
       const lx = pageX - ax - headerW;
       const ly = pageY - ay - headerH;
-      if (lx < 0 || ly < 0) return;
+      if (lx < 0 && ly < 0) return;
       const x = lx < frozenW ? lx : lx + scroll.current.x;
       const y = ly < frozenH ? ly : ly + scroll.current.y;
+      // A header tap opens or closes the hidden run at its marker.
+      if (ly < 0 || lx < 0) {
+        if (showHidden) return;
+        const axis = ly < 0 ? "cols" : "rows";
+        const start = ly < 0 ? foldTarget(cols, colRuns, opened.cols, x, FOLD_HIT_PX) : foldTarget(rows, rowRuns, opened.rows, y, FOLD_HIT_PX);
+        if (start !== null) toggleFold(axis, start);
+        return;
+      }
       const r = rows.indexAt(y);
       const c = cols.indexAt(x);
       const merge = merges.at(r, c);
@@ -225,7 +444,7 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
 
   const totalW = cols.total;
   const totalH = rows.total;
-  const layerBase = { layout, rows, cols, cells: allCells, merges, styles, zoom, showGrid, showHidden, rowStyle, colStyle, comments, selected, slimText };
+  const layerBase = { layout, rows, cols, cells: allCells, merges, styles, zoom, showGrid, showHidden, rowStyle, colStyle, comments, selected, slimText, lite };
   const mainWin = useMemo<Window>(() => ({ r0: Math.max(win.r0, frozenRows), r1: win.r1, c0: Math.max(win.c0, frozenCols), c1: win.c1 }), [win, frozenRows, frozenCols]);
   const topWin = useMemo<Window>(() => ({ r0: 0, r1: frozenRows - 1, c0: Math.max(win.c0, frozenCols), c1: win.c1 }), [win.c0, win.c1, frozenRows, frozenCols]);
   const sideWin = useMemo<Window>(() => ({ r0: Math.max(win.r0, frozenRows), r1: win.r1, c0: 0, c1: frozenCols - 1 }), [win.r0, win.r1, frozenRows, frozenCols]);
@@ -234,8 +453,8 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
   const content = (
     <View style={{ width: totalW, height: totalH, backgroundColor: "#FFFFFF" }}>
       {mainWin.r0 <= mainWin.r1 && mainWin.c0 <= mainWin.c1 ? <SheetLayer {...layerBase} win={mainWin} ox={0} oy={0} /> : null}
-      <Drawings file={file} revision={meta.revision} drawings={layout.drawings} rows={rows} cols={cols} zoom={zoom} view={viewRect} />
-      <Pages layout={layout} rows={rows} cols={cols} zoom={zoom} win={win} preview={preview} />
+      {lite ? null : <Drawings file={file} revision={meta.revision} drawings={layout.drawings} rows={rows} cols={cols} zoom={zoom} view={viewRect} />}
+      {lite ? null : <Pages layout={layout} rows={rows} cols={cols} zoom={zoom} win={win} preview={preview} />}
     </View>
   );
 
@@ -248,8 +467,8 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     );
   } else if (Platform.OS === "android") {
     scroller = (
-      <Animated.ScrollView ref={outer} style={{ position: "absolute", left: headerW, top: headerH, right: 0, bottom: 0 }} nestedScrollEnabled onScroll={nativeScroll.y} scrollEventThrottle={16}>
-        <Animated.ScrollView ref={inner} horizontal nestedScrollEnabled onScroll={nativeScroll.x} scrollEventThrottle={16}>
+      <Animated.ScrollView ref={outer} style={{ position: "absolute", left: headerW, top: headerH, right: 0, bottom: 0 }} scrollEnabled={!pinching} nestedScrollEnabled onScroll={nativeScroll.y} scrollEventThrottle={16}>
+        <Animated.ScrollView ref={inner} horizontal scrollEnabled={!pinching} nestedScrollEnabled onScroll={nativeScroll.x} scrollEventThrottle={16}>
           {content}
         </Animated.ScrollView>
         {bottomClearance > 0 ? <View style={{ height: bottomClearance }} /> : null}
@@ -262,6 +481,7 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
         style={{ position: "absolute", left: headerW, top: headerH, right: 0, bottom: 0 }}
         contentContainerStyle={{ width: totalW, height: totalH + bottomClearance }}
         directionalLockEnabled={false}
+        scrollEnabled={!pinching}
         onScroll={nativeScroll.xy}
         scrollEventThrottle={16}
       >
@@ -277,10 +497,13 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     const out: ReactElement[] = [];
     for (let c = from; c <= to; c++) {
       const w = cols.size(c);
+      if (folded(cols, c) && !folded(cols, c - 1)) {
+        out.push(<View key={`z${c}`} style={{ position: "absolute", left: cols.start(c) - ox - 2, top: 0, width: 4, height: headerH, backgroundColor: FOLD_COLOR, borderRadius: 2, zIndex: 1 }} />);
+      }
       if (w === 0) continue;
       const active = selectedCols !== null && c >= selectedCols[0]! && c <= selectedCols[1]!;
       out.push(
-        <View key={c} style={{ position: "absolute", left: cols.start(c) - ox, top: 0, width: w, height: headerH, borderRightWidth: 1, borderBottomWidth: 1, borderColor: HEADER_LINE, backgroundColor: active ? HEADER_ACTIVE : cols.hidden[c] ? "#E4E4E4" : HEADER_BG, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+        <View key={c} style={{ position: "absolute", left: cols.start(c) - ox, top: 0, width: w, height: headerH, borderRightWidth: 1, borderBottomWidth: 1, borderColor: HEADER_LINE, backgroundColor: active ? HEADER_ACTIVE : cols.hidden[c] ? HEADER_HIDDEN : HEADER_BG, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
           <Text style={{ fontSize: headerFont, color: active ? SELECT_COLOR : HEADER_TEXT }} numberOfLines={1}>{columnLabel(c)}</Text>
         </View>,
       );
@@ -291,10 +514,13 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     const out: ReactElement[] = [];
     for (let r = from; r <= to; r++) {
       const h = rows.size(r);
+      if (folded(rows, r) && !folded(rows, r - 1)) {
+        out.push(<View key={`z${r}`} style={{ position: "absolute", left: 0, top: rows.start(r) - oy - 2, width: headerW, height: 4, backgroundColor: FOLD_COLOR, borderRadius: 2, zIndex: 1 }} />);
+      }
       if (h === 0) continue;
       const active = selectedRows !== null && r >= selectedRows[0]! && r <= selectedRows[1]!;
       out.push(
-        <View key={r} style={{ position: "absolute", left: 0, top: rows.start(r) - oy, width: headerW, height: h, borderRightWidth: 1, borderBottomWidth: 1, borderColor: HEADER_LINE, backgroundColor: active ? HEADER_ACTIVE : rows.hidden[r] ? "#E4E4E4" : HEADER_BG, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+        <View key={r} style={{ position: "absolute", left: 0, top: rows.start(r) - oy, width: headerW, height: h, borderRightWidth: 1, borderBottomWidth: 1, borderColor: HEADER_LINE, backgroundColor: active ? HEADER_ACTIVE : rows.hidden[r] ? HEADER_HIDDEN : HEADER_BG, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
           {h >= headerFont ? <Text style={{ fontSize: headerFont, color: active ? SELECT_COLOR : HEADER_TEXT }} numberOfLines={1}>{r + 1}</Text> : null}
         </View>,
       );
@@ -304,7 +530,8 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
 
   const bandLine = frozenRows > 0 || frozenCols > 0 ? "#9E9E9E" : GRID_COLOR;
   return (
-    <View ref={area} style={{ flex: 1, backgroundColor: "#FFFFFF", overflow: "hidden" }} onLayout={onLayout}>
+    <View ref={area} style={{ flex: 1, backgroundColor: "#FFFFFF", overflow: "hidden" }} onLayout={onLayout} {...pinchHandlers}>
+      <Animated.View style={{ flex: 1, transform: [{ translateX: pinchX }, { translateY: pinchY }, { scale: pinchScale }] }}>
       <Pressable style={{ flex: 1 }} onPress={press} accessibilityLabel={`${layout.name} 시트`}>
         {scroller}
 
@@ -352,6 +579,7 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
           </>
         ) : null}
       </Pressable>
+      </Animated.View>
     </View>
   );
 }
