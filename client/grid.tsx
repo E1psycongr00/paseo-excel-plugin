@@ -57,6 +57,12 @@ export const MIN_ZOOM = 0.25;
 export const MAX_ZOOM = 3;
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
+/** Minimum time between drawing more cells for what a pinch brings into view. */
+const PINCH_GROW_MS = 80;
+const TOP_LEFT = "left top";
+
+const unionWindow = (a: Window, b: Window): Window => ({ r0: Math.min(a.r0, b.r0), r1: Math.max(a.r1, b.r1), c0: Math.min(a.c0, b.c0), c1: Math.max(a.c1, b.c1) });
+
 /** Finger distance and midpoint, in page px. */
 interface Touch2 {
   dist: number;
@@ -307,33 +313,60 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     measureArea();
   };
 
-  // Two-finger pinch zooms and pans on phones. While the fingers move, the drawn screen is only scaled
-  // and moved (nothing re-renders); on release the zoom is applied once and the scroll keeps the pinched
-  // spot under the fingers. Applying it mid-gesture too made the screen shake at every step, because
+  // Two-finger pinch zooms and pans on phones. While the fingers move, the sheet, the frozen bands and
+  // the headers are each scaled inside their own fixed frames (scrolling axes about the fingers, frozen
+  // axes about their edge), and cells the gesture brings into view are drawn at the current zoom, so
+  // nothing already drawn moves or redraws. On release the zoom is applied once and the scroll keeps
+  // the pinched spot under the fingers. Applying the zoom mid-gesture made the screen shake, because
   // the redrawn sheet and the reset preview do not reach the screen in the same frame.
   const pinchEnabled = !isWeb && onZoomTo !== undefined;
   const pinch = useRef<Pinch | null>(null);
   const pendingScroll = useRef<{ x: number; y: number } | null>(null);
   const [pinching, setPinching] = useState(false);
+  // bandScale shares transforms with the natively driven scroll offsets; pinchScale does not.
   const pinchScale = useRef(new Animated.Value(1)).current;
-  const pinchX = useRef(new Animated.Value(0)).current;
-  const pinchY = useRef(new Animated.Value(0)).current;
+  const bandScale = useRef(new Animated.Value(1)).current;
+  const mainX = useRef(new Animated.Value(0)).current;
+  const mainY = useRef(new Animated.Value(0)).current;
+  const bandX = useRef(new Animated.Value(0)).current;
+  const bandY = useRef(new Animated.Value(0)).current;
+  const grownAt = useRef(0);
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
   const resetPinch = useCallback(() => {
-    pinchScale.setValue(1);
-    pinchX.setValue(0);
-    pinchY.setValue(0);
-  }, [pinchScale, pinchX, pinchY]);
+    for (const value of [pinchScale, bandScale]) value.setValue(1);
+    for (const value of [mainX, mainY, bandX, bandY]) value.setValue(0);
+  }, [pinchScale, bandScale, mainX, mainY, bandX, bandY]);
   /** Scale of `touch` against `base` at the zoom on screen, within the zoom limits. */
   const pinchScaleOf = (base: Touch2, touch: Touch2) => clamp((zoomRef.current * touch.dist) / base.dist, MIN_ZOOM, MAX_ZOOM) / zoomRef.current;
   const showPinch = (base: Touch2, touch: Touch2) => {
     const scale = pinchScaleOf(base, touch);
     const box = areaBox.current;
-    // Transforms scale about the view's centre: shift so the base midpoint stays put, then follow the fingers.
+    // Base midpoint in the grid area, and how far the fingers moved since.
+    const fx = base.mx - box.x;
+    const fy = base.my - box.y;
+    const dx = touch.mx - base.mx;
+    const dy = touch.my - base.my;
+    const { x: sx, y: sy } = scroll.current;
+    // A view whose top-left sits at o and scales about it maps p to f + d + s(p - f) when shifted by
+    // (f - o)(1 - s) + d. The sheet sits at header - scroll; scrolling bands start a frozen size later.
+    const tx = (fx - (headerW - sx)) * (1 - scale) + dx;
+    const ty = (fy - (headerH - sy)) * (1 - scale) + dy;
     pinchScale.setValue(scale);
-    pinchX.setValue((base.mx - box.x - box.width / 2) * (1 - scale) + touch.mx - base.mx);
-    pinchY.setValue((base.my - box.y - box.height / 2) * (1 - scale) + touch.my - base.my);
+    bandScale.setValue(scale);
+    mainX.setValue(tx);
+    mainY.setValue(ty);
+    bandX.setValue(tx - frozenW * (1 - scale));
+    bandY.setValue(ty - frozenH * (1 - scale));
+
+    // Draw the cells now in view at the current zoom; what is drawn stays, so nothing on screen moves.
+    const now = Date.now();
+    if (now - grownAt.current < PINCH_GROW_MS) return;
+    grownAt.current = now;
+    const x0 = fx + (headerW - fx - dx) / scale - headerW + sx;
+    const y0 = fy + (headerH - fy - dy) / scale - headerH + sy;
+    const next = visibleWindow(rows, cols, Math.max(0, x0), Math.max(0, y0), viewport.width / scale, viewport.height / scale);
+    setWin((current) => (contains(current, next) ? current : unionWindow(current, next)));
   };
   /** Applies the gesture so far as real zoom and scroll; the preview transform restarts from here. */
   const pinchStep = (current: Pinch) => {
@@ -379,6 +412,11 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     const touch = twoTouches(event);
     if (!touch || pinch.current) return;
     measureArea();
+    // The window grows from the pinch now; a pending idle step would replace it.
+    if (idleTimer.current) {
+      clearTimeout(idleTimer.current);
+      idleTimer.current = null;
+    }
     pinch.current = { base: touch, last: touch, inFlight: null, ended: false };
     setPinching(true);
   };
@@ -451,11 +489,11 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
   const cornerWin = useMemo<Window>(() => ({ r0: 0, r1: frozenRows - 1, c0: 0, c1: frozenCols - 1 }), [frozenRows, frozenCols]);
 
   const content = (
-    <View style={{ width: totalW, height: totalH, backgroundColor: "#FFFFFF" }}>
+    <Animated.View style={{ width: totalW, height: totalH, backgroundColor: "#FFFFFF", transformOrigin: TOP_LEFT, transform: [{ translateX: mainX }, { translateY: mainY }, { scale: pinchScale }] }}>
       {mainWin.r0 <= mainWin.r1 && mainWin.c0 <= mainWin.c1 ? <SheetLayer {...layerBase} win={mainWin} ox={0} oy={0} /> : null}
       {lite ? null : <Drawings file={file} revision={meta.revision} drawings={layout.drawings} rows={rows} cols={cols} zoom={zoom} view={viewRect} />}
       {lite ? null : <Pages layout={layout} rows={rows} cols={cols} zoom={zoom} win={win} preview={preview} />}
-    </View>
+    </Animated.View>
   );
 
   let scroller: ReactElement;
@@ -531,14 +569,13 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
   const bandLine = frozenRows > 0 || frozenCols > 0 ? "#9E9E9E" : GRID_COLOR;
   return (
     <View ref={area} style={{ flex: 1, backgroundColor: "#FFFFFF", overflow: "hidden" }} onLayout={onLayout} {...pinchHandlers}>
-      <Animated.View style={{ flex: 1, transform: [{ translateX: pinchX }, { translateY: pinchY }, { scale: pinchScale }] }}>
       <Pressable style={{ flex: 1 }} onPress={press} accessibilityLabel={`${layout.name} 시트`}>
         {scroller}
 
         {/* Frozen rows across the scrolling columns */}
         {frozenRows > 0 ? (
           <View pointerEvents="none" style={{ position: "absolute", top: headerH, left: headerW + frozenW, right: 0, height: frozenH, overflow: "hidden", borderBottomWidth: 1, borderColor: bandLine, backgroundColor: "#FFFFFF" }}>
-            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: frozenH, transform: [{ translateX: negX }] }}>
+            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: frozenH, transformOrigin: TOP_LEFT, transform: [{ translateX: negX }, { translateX: bandX }, { scale: bandScale }] }}>
               <SheetLayer {...layerBase} win={topWin} ox={frozenW} oy={0} />
             </Animated.View>
           </View>
@@ -546,31 +583,41 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
         {/* Frozen columns down the scrolling rows */}
         {frozenCols > 0 ? (
           <View pointerEvents="none" style={{ position: "absolute", top: headerH + frozenH, left: headerW, bottom: 0, width: frozenW, overflow: "hidden", borderRightWidth: 1, borderColor: bandLine, backgroundColor: "#FFFFFF" }}>
-            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: frozenW, height: totalH, transform: [{ translateY: negY }] }}>
+            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: frozenW, height: totalH, transformOrigin: TOP_LEFT, transform: [{ translateY: negY }, { translateY: bandY }, { scale: bandScale }] }}>
               <SheetLayer {...layerBase} win={sideWin} ox={0} oy={frozenH} />
             </Animated.View>
           </View>
         ) : null}
         {frozenRows > 0 && frozenCols > 0 ? (
           <View pointerEvents="none" style={{ position: "absolute", top: headerH, left: headerW, width: frozenW, height: frozenH, overflow: "hidden", borderRightWidth: 1, borderBottomWidth: 1, borderColor: bandLine, backgroundColor: "#FFFFFF" }}>
-            <SheetLayer {...layerBase} win={cornerWin} ox={0} oy={0} />
+            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: frozenW, height: frozenH, transformOrigin: TOP_LEFT, transform: [{ scale: pinchScale }] }}>
+              <SheetLayer {...layerBase} win={cornerWin} ox={0} oy={0} />
+            </Animated.View>
           </View>
         ) : null}
 
         {showHeaders ? (
           <>
             <View pointerEvents="none" style={{ position: "absolute", top: 0, left: headerW, right: 0, height: headerH, overflow: "hidden", backgroundColor: HEADER_BG }}>
-              {frozenCols > 0 ? colHeaders(0, frozenCols - 1, 0) : null}
+              {frozenCols > 0 ? (
+                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: frozenW, height: headerH, transformOrigin: TOP_LEFT, transform: [{ scale: pinchScale }] }}>
+                  {colHeaders(0, frozenCols - 1, 0)}
+                </Animated.View>
+              ) : null}
               <View style={{ position: "absolute", left: frozenW, top: 0, right: 0, height: headerH, overflow: "hidden" }}>
-                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: headerH, transform: [{ translateX: negX }] }}>
+                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: headerH, transformOrigin: TOP_LEFT, transform: [{ translateX: negX }, { translateX: bandX }, { scale: bandScale }] }}>
                   {colHeaders(Math.max(win.c0, frozenCols), win.c1, frozenW)}
                 </Animated.View>
               </View>
             </View>
             <View pointerEvents="none" style={{ position: "absolute", top: headerH, left: 0, bottom: 0, width: headerW, overflow: "hidden", backgroundColor: HEADER_BG }}>
-              {frozenRows > 0 ? rowHeaders(0, frozenRows - 1, 0) : null}
+              {frozenRows > 0 ? (
+                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: headerW, height: frozenH, transformOrigin: TOP_LEFT, transform: [{ scale: pinchScale }] }}>
+                  {rowHeaders(0, frozenRows - 1, 0)}
+                </Animated.View>
+              ) : null}
               <View style={{ position: "absolute", top: frozenH, left: 0, bottom: 0, width: headerW, overflow: "hidden" }}>
-                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: headerW, height: totalH, transform: [{ translateY: negY }] }}>
+                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: headerW, height: totalH, transformOrigin: TOP_LEFT, transform: [{ translateY: negY }, { translateY: bandY }, { scale: bandScale }] }}>
                   {rowHeaders(Math.max(win.r0, frozenRows), win.r1, frozenH)}
                 </Animated.View>
               </View>
@@ -579,7 +626,6 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
           </>
         ) : null}
       </Pressable>
-      </Animated.View>
     </View>
   );
 }
