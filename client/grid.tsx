@@ -323,20 +323,28 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
   const pinch = useRef<Pinch | null>(null);
   const pendingScroll = useRef<{ x: number; y: number } | null>(null);
   const [pinching, setPinching] = useState(false);
-  // bandScale shares transforms with the natively driven scroll offsets; pinchScale does not.
   const pinchScale = useRef(new Animated.Value(1)).current;
-  const bandScale = useRef(new Animated.Value(1)).current;
   const mainX = useRef(new Animated.Value(0)).current;
   const mainY = useRef(new Animated.Value(0)).current;
   const bandX = useRef(new Animated.Value(0)).current;
   const bandY = useRef(new Animated.Value(0)).current;
+  // The bands and headers share transforms with the natively driven scroll offsets, so their pinch
+  // values run on the native driver. The sheet's ran on JS and reached the screen a frame apart from
+  // them, which made the body and headers jitter against each other; a no-op native animation moves
+  // every pinch value to the native driver so one setValue batch updates them all in the same frame.
+  useEffect(() => {
+    if (!pinchEnabled) return;
+    for (const value of [pinchScale, mainX, mainY, bandX, bandY]) {
+      Animated.timing(value, { toValue: value === pinchScale ? 1 : 0, duration: 0, useNativeDriver: true }).start();
+    }
+  }, [pinchEnabled, pinchScale, mainX, mainY, bandX, bandY]);
   const grownAt = useRef(0);
   const zoomRef = useRef(zoom);
   zoomRef.current = zoom;
   const resetPinch = useCallback(() => {
-    for (const value of [pinchScale, bandScale]) value.setValue(1);
+    pinchScale.setValue(1);
     for (const value of [mainX, mainY, bandX, bandY]) value.setValue(0);
-  }, [pinchScale, bandScale, mainX, mainY, bandX, bandY]);
+  }, [pinchScale, mainX, mainY, bandX, bandY]);
   /** Scale of `touch` against `base` at the zoom on screen, within the zoom limits. */
   const pinchScaleOf = (base: Touch2, touch: Touch2) => clamp((zoomRef.current * touch.dist) / base.dist, MIN_ZOOM, MAX_ZOOM) / zoomRef.current;
   const showPinch = (base: Touch2, touch: Touch2) => {
@@ -353,7 +361,6 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
     const tx = (fx - (headerW - sx)) * (1 - scale) + dx;
     const ty = (fy - (headerH - sy)) * (1 - scale) + dy;
     pinchScale.setValue(scale);
-    bandScale.setValue(scale);
     mainX.setValue(tx);
     mainY.setValue(ty);
     bandX.setValue(tx - frozenW * (1 - scale));
@@ -575,7 +582,7 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
         {/* Frozen rows across the scrolling columns */}
         {frozenRows > 0 ? (
           <View pointerEvents="none" style={{ position: "absolute", top: headerH, left: headerW + frozenW, right: 0, height: frozenH, overflow: "hidden", borderBottomWidth: 1, borderColor: bandLine, backgroundColor: "#FFFFFF" }}>
-            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: frozenH, transformOrigin: TOP_LEFT, transform: [{ translateX: negX }, { translateX: bandX }, { scale: bandScale }] }}>
+            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: frozenH, transformOrigin: TOP_LEFT, transform: [{ translateX: negX }, { translateX: bandX }, { scale: pinchScale }] }}>
               <SheetLayer {...layerBase} win={topWin} ox={frozenW} oy={0} />
             </Animated.View>
           </View>
@@ -583,7 +590,7 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
         {/* Frozen columns down the scrolling rows */}
         {frozenCols > 0 ? (
           <View pointerEvents="none" style={{ position: "absolute", top: headerH + frozenH, left: headerW, bottom: 0, width: frozenW, overflow: "hidden", borderRightWidth: 1, borderColor: bandLine, backgroundColor: "#FFFFFF" }}>
-            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: frozenW, height: totalH, transformOrigin: TOP_LEFT, transform: [{ translateY: negY }, { translateY: bandY }, { scale: bandScale }] }}>
+            <Animated.View style={{ position: "absolute", left: 0, top: 0, width: frozenW, height: totalH, transformOrigin: TOP_LEFT, transform: [{ translateY: negY }, { translateY: bandY }, { scale: pinchScale }] }}>
               <SheetLayer {...layerBase} win={sideWin} ox={0} oy={frozenH} />
             </Animated.View>
           </View>
@@ -605,7 +612,7 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
                 </Animated.View>
               ) : null}
               <View style={{ position: "absolute", left: frozenW, top: 0, right: 0, height: headerH, overflow: "hidden" }}>
-                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: headerH, transformOrigin: TOP_LEFT, transform: [{ translateX: negX }, { translateX: bandX }, { scale: bandScale }] }}>
+                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: totalW, height: headerH, transformOrigin: TOP_LEFT, transform: [{ translateX: negX }, { translateX: bandX }, { scale: pinchScale }] }}>
                   {colHeaders(Math.max(win.c0, frozenCols), win.c1, frozenW)}
                 </Animated.View>
               </View>
@@ -617,7 +624,7 @@ export function Grid({ file, meta, layout, options, selected, onSelect, onZoomWh
                 </Animated.View>
               ) : null}
               <View style={{ position: "absolute", top: frozenH, left: 0, bottom: 0, width: headerW, overflow: "hidden" }}>
-                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: headerW, height: totalH, transformOrigin: TOP_LEFT, transform: [{ translateY: negY }, { translateY: bandY }, { scale: bandScale }] }}>
+                <Animated.View style={{ position: "absolute", left: 0, top: 0, width: headerW, height: totalH, transformOrigin: TOP_LEFT, transform: [{ translateY: negY }, { translateY: bandY }, { scale: pinchScale }] }}>
                   {rowHeaders(Math.max(win.r0, frozenRows), win.r1, frozenH)}
                 </Animated.View>
               </View>
