@@ -34,6 +34,8 @@ export interface LayerProps {
   selected: Range | null;
   /** Single-view text for cells that clearly fit (temporary toggle to compare against the wrapper). */
   slimText: boolean;
+  /** Quick review: values only, in one plain font, clipped to their cells; no fills, borders or spill. */
+  lite: boolean;
 }
 
 const key = (r: number, c: number) => r * 16384 + c;
@@ -213,12 +215,125 @@ interface CachedTile {
 
 /** Everything a tile depends on except cells, which are checked per row through `reads`. */
 function tileDeps(props: LayerProps): unknown[] {
-  return [props.layout, props.rows, props.cols, props.merges, props.styles, props.zoom, props.showGrid, props.showHidden, props.rowStyle, props.colStyle, props.comments, props.ox, props.oy, props.slimText];
+  return [props.layout, props.rows, props.cols, props.merges, props.styles, props.zoom, props.showGrid, props.showHidden, props.rowStyle, props.colStyle, props.comments, props.ox, props.oy, props.slimText, props.lite];
 }
 
 function sameDeps(a: unknown[], b: unknown[]): boolean {
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
   return true;
+}
+
+export const LITE_TEXT_COLOR = "#1F1F1F";
+/** Quick review font size and row height in px at 100% zoom. */
+export const LITE_FONT_PX = 13;
+export const LITE_ROW_PX = 22;
+
+function liteAlign(cell: Cell): TextStyle["textAlign"] {
+  if (cell.k === "n" || cell.k === "d") return "right";
+  if (cell.k === "b" || cell.k === "e") return "center";
+  return "left";
+}
+
+/**
+ * Quick review drawing: gridlines, then one Text per value cut off at its own cell (or merge), so a
+ * screen costs about one native view per filled cell. Formatting in the file is ignored on purpose.
+ */
+function drawLiteTile(props: LayerProps, tile: Tile, rowCells: (r: number) => Map<number, Cell> | undefined, layers: TileLayers) {
+  const { rows, cols, ox, oy, merges, zoom, showHidden, comments } = props;
+  const { grid, fills, texts, marks } = layers;
+  const left = cols.start(tile.c0) - ox;
+  const top = rows.start(tile.r0) - oy;
+  const right = cols.end(tile.c1) - ox;
+  const bottom = rows.end(tile.r1) - oy;
+  const fontSize = LITE_FONT_PX * zoom;
+  const lineHeight = Math.ceil(fontSize * 1.25);
+  const pad = Math.max(2, 3 * zoom);
+  const text = (id: string, cell: Cell, x: number, y: number, w: number, h: number, center: boolean) => {
+    if (w <= pad * 2 || h <= 0) return;
+    // Lines inside a value would push the rest out of a one-line box; review them in the cell details.
+    const value = cell.v.indexOf("\n") >= 0 ? cell.v.replace(/\s*\n\s*/g, " ") : cell.v;
+    texts.push(
+      <Text
+        key={id}
+        numberOfLines={1}
+        ellipsizeMode="clip"
+        style={{ position: "absolute", left: x + pad, top: y + Math.max(0, (h - lineHeight) / 2), width: w - pad * 2, fontSize, lineHeight, color: LITE_TEXT_COLOR, textAlign: center ? "center" : liteAlign(cell) }}
+      >
+        {value}
+      </Text>,
+    );
+  };
+
+  for (let c = tile.c0; c <= tile.c1 + 1; c++) {
+    if (c <= tile.c1 && cols.size(c) === 0) continue;
+    grid.push(<View key={`gc${c}`} style={{ position: "absolute", left: cols.start(c) - ox, top, width: 1, height: bottom - top, backgroundColor: GRID_COLOR }} />);
+  }
+  for (let r = tile.r0; r <= tile.r1 + 1; r++) {
+    if (r <= tile.r1 && rows.size(r) === 0) continue;
+    grid.push(<View key={`gr${r}`} style={{ position: "absolute", left, top: rows.start(r) - oy, width: right - left, height: 1, backgroundColor: GRID_COLOR }} />);
+  }
+
+  for (let r = tile.r0; r <= tile.r1; r++) {
+    const h = rows.size(r);
+    if (h === 0) continue;
+    const row = rowCells(r);
+    if (!row) continue;
+    for (let c = tile.c0; c <= tile.c1; c++) {
+      const cell = row.get(c);
+      if (!cell) continue;
+      const w = cols.size(c);
+      if (w === 0 || merges.at(r, c)) continue;
+      const x = cols.start(c) - ox;
+      const y = rows.start(r) - oy;
+      if (cell.v) text(`t${r}_${c}`, cell, x, y, w, h, false);
+      if (comments.has(key(r, c))) marks.push(commentMark(`m${r}_${c}`, x + w, y, zoom));
+    }
+  }
+
+  for (const merge of merges.ownedBy(tile)) {
+    const [r1, c1, r2, c2] = merge;
+    const x = cols.start(c1) - ox;
+    const y = rows.start(r1) - oy;
+    const w = cols.end(c2) - cols.start(c1);
+    const h = rows.end(r2) - rows.start(r1);
+    if (w <= 0 || h <= 0) continue;
+    // A merge shows as one box: blank out the gridlines inside it.
+    fills.push(<View key={`mf${r1}_${c1}`} style={{ position: "absolute", left: x + 1, top: y + 1, width: w - 1, height: h - 1, backgroundColor: "#FFFFFF" }} />);
+    const cell = rowCells(r1)?.get(c1);
+    if (cell && cell.v) text(`mt${r1}_${c1}`, cell, x, y, w, h, c2 > c1);
+    if (comments.has(key(r1, c1))) marks.push(commentMark(`mm${r1}_${c1}`, x + w, y, zoom));
+  }
+
+  hiddenShading(props, tile, marks);
+  // Where hidden rows or columns are folded away, a darker line shows that something sits there.
+  for (let c = tile.c0; c <= tile.c1; c++) {
+    if (folded(cols, c) && !folded(cols, c - 1)) marks.push(<View key={`zc${c}`} pointerEvents="none" style={{ position: "absolute", left: cols.start(c) - ox - 1, top, width: 2, height: bottom - top, backgroundColor: FOLD_COLOR }} />);
+  }
+  for (let r = tile.r0; r <= tile.r1; r++) {
+    if (folded(rows, r) && !folded(rows, r - 1)) marks.push(<View key={`zr${r}`} pointerEvents="none" style={{ position: "absolute", left, top: rows.start(r) - oy - 1, width: right - left, height: 2, backgroundColor: FOLD_COLOR }} />);
+  }
+}
+
+export const FOLD_COLOR = "#7C8B99";
+export const HIDDEN_SHADE = "rgba(120,120,120,0.18)";
+
+/** A hidden entry currently laid out at zero size. */
+export function folded(axis: Axis, index: number): boolean {
+  return index >= 0 && index < axis.count && axis.hidden[index] === 1 && axis.size(index) === 0;
+}
+
+function hiddenShading(props: LayerProps, tile: Tile, marks: ReactElement[]) {
+  const { rows, cols, ox, oy } = props;
+  const left = cols.start(tile.c0) - ox;
+  const top = rows.start(tile.r0) - oy;
+  const right = cols.end(tile.c1) - ox;
+  const bottom = rows.end(tile.r1) - oy;
+  for (let r = tile.r0; r <= tile.r1; r++) {
+    if (rows.hidden[r] && rows.size(r) > 0) marks.push(<View key={`hr${r}`} pointerEvents="none" style={{ position: "absolute", left, top: rows.start(r) - oy, width: right - left, height: rows.size(r), backgroundColor: HIDDEN_SHADE }} />);
+  }
+  for (let c = tile.c0; c <= tile.c1; c++) {
+    if (cols.hidden[c] && cols.size(c) > 0) marks.push(<View key={`hc${c}`} pointerEvents="none" style={{ position: "absolute", left: cols.start(c) - ox, top, width: cols.size(c), height: bottom - top, backgroundColor: HIDDEN_SHADE }} />);
+  }
 }
 
 function drawTile(props: LayerProps, tile: Tile): { reads: CachedTile["reads"]; layers: TileLayers } {
@@ -231,6 +346,10 @@ function drawTile(props: LayerProps, tile: Tile): { reads: CachedTile["reads"]; 
     return row;
   };
   const layers: TileLayers = { grid: [], blanks: [], fills: [], texts: [], borders: [], marks: [] };
+  if (props.lite) {
+    drawLiteTile(props, tile, rowCells, layers);
+    return { reads, layers };
+  }
   const { grid, blanks, fills, texts, borders, marks } = layers;
 
   const left = cols.start(tile.c0) - ox;
@@ -322,14 +441,7 @@ function drawTile(props: LayerProps, tile: Tile): { reads: CachedTile["reads"]; 
     if (comment) marks.push(commentMark(`mm${r1}_${c1}`, x + w, y, zoom));
   }
 
-  if (showHidden) {
-    for (let r = tile.r0; r <= tile.r1; r++) {
-      if (rows.hidden[r]) marks.push(<View key={`hr${r}`} pointerEvents="none" style={{ position: "absolute", left, top: rows.start(r) - oy, width: right - left, height: rows.size(r), backgroundColor: "rgba(120,120,120,0.18)" }} />);
-    }
-    for (let c = tile.c0; c <= tile.c1; c++) {
-      if (cols.hidden[c]) marks.push(<View key={`hc${c}`} pointerEvents="none" style={{ position: "absolute", left: cols.start(c) - ox, top, width: cols.size(c), height: bottom - top, backgroundColor: "rgba(120,120,120,0.18)" }} />);
-    }
-  }
+  hiddenShading(props, tile, marks);
   return { reads, layers };
 }
 

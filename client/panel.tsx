@@ -18,13 +18,21 @@ const ZOOM_STEPS = [0.25, 0.33, 0.4, 0.5, 0.6, 0.75, 0.85, 1, 1.15, 1.3, 1.5, 1.
 
 interface TabState {
   sheet?: number;
+  /** Quick review (true) or the formatted view (false). */
+  lite?: boolean;
 }
 
 function readTabState(state: unknown): TabState {
   if (typeof state !== "object" || state === null) return {};
-  const sheet = (state as { sheet?: unknown }).sheet;
-  return typeof sheet === "number" && Number.isInteger(sheet) && sheet >= 0 ? { sheet } : {};
+  const { sheet, lite } = state as { sheet?: unknown; lite?: unknown };
+  const out: TabState = {};
+  if (typeof sheet === "number" && Number.isInteger(sheet) && sheet >= 0) out.sheet = sheet;
+  if (typeof lite === "boolean") out.lite = lite;
+  return out;
 }
+
+// The mode last picked in any tab; new tabs open in it. Quick review until the user picks otherwise.
+let lastLite = true;
 
 function errorText(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
@@ -87,10 +95,18 @@ function WorkbookView({ meta, fileKey, theme, compact, tab, onStale }: WorkbookV
   const saved = readTabState(tab.state);
   // Same choice as the daemon's, so the sheet that came bundled with the open is the one shown.
   const [sheet, setSheet] = useState(() => initialSheet(meta, saved.sheet));
+  // Both modes draw from the same parsed cells, so switching only redraws the screen.
+  const [lite, setLite] = useState(() => saved.lite ?? lastLite);
   const [showHidden, setShowHidden] = useState(false);
   const selectSheet = (index: number) => {
     setSheet(index);
-    tab.setState({ sheet: index });
+    tab.setState({ sheet: index, lite });
+  };
+  const toggleLite = () => {
+    const next = !lite;
+    setLite(next);
+    lastLite = next;
+    tab.setState({ sheet, lite: next });
   };
   const layoutQuery = useSheetLayout(fileKey, meta.revision, sheet);
   useEffect(() => {
@@ -129,7 +145,7 @@ function WorkbookView({ meta, fileKey, theme, compact, tab, onStale }: WorkbookV
     <View style={styles.root}>
       {tabBar}
       {layoutQuery.data ? (
-        <SheetView key={`${sheet}`} meta={meta} layout={layoutQuery.data} fileKey={fileKey} theme={theme} compact={compact} showHidden={showHidden} setShowHidden={setShowHidden} />
+        <SheetView key={`${sheet}`} lite={lite} onToggleLite={toggleLite} meta={meta} layout={layoutQuery.data} fileKey={fileKey} theme={theme} compact={compact} showHidden={showHidden} setShowHidden={setShowHidden} />
       ) : layoutQuery.error ? (
         <View style={styles.center}>
           <Text style={styles.muted}>{errorText(layoutQuery.error)}</Text>
@@ -147,6 +163,8 @@ function WorkbookView({ meta, fileKey, theme, compact, tab, onStale }: WorkbookV
 }
 
 interface SheetViewProps {
+  lite: boolean;
+  onToggleLite(): void;
   meta: WorkbookMeta;
   layout: SheetLayout;
   fileKey: { workspaceId: string; path: string };
@@ -168,11 +186,11 @@ function fitZoom(layout: SheetLayout, width: number): number {
   return Math.max(0.25, Math.min(3, (width - 40) / total));
 }
 
-function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowHidden }: SheetViewProps) {
+function SheetView({ lite, onToggleLite, meta, layout, fileKey, theme, compact, showHidden, setShowHidden }: SheetViewProps) {
   const styles = useMemo(() => chrome(theme, compact), [theme, compact]);
   const [width, setWidth] = useState(0);
   const [zoom, setZoom] = useState<number | null>(null);
-  const [preview, setPreview] = useState(layout.view.mode === "pageBreakPreview");
+  const [preview, setPreview] = useState(!lite && layout.view.mode === "pageBreakPreview");
   const [selected, setSelected] = useState<Range | null>(null);
   // Temporary comparison toggle for the single-view text drawing; remove once checked against Excel.
   const [slimText, setSlimText] = useState(true);
@@ -192,6 +210,7 @@ function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowH
       return Math.max(0.25, Math.min(3, Math.round(base * (delta > 0 ? 0.9 : 1.1) * 100) / 100));
     });
   }, [effectiveZoom]);
+  const onZoomTo = useCallback((value: number) => setZoom(Math.max(0.25, Math.min(3, value))), []);
 
   const options: GridOptions = {
     zoom: effectiveZoom,
@@ -200,6 +219,7 @@ function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowH
     showGrid: layout.view.showGrid,
     showHeaders: layout.view.showHeaders && !(compact && width < 360),
     slimText,
+    lite,
   };
   const select = useCallback((r: number, c: number) => {
     const merge = layout.merges.find((m) => m[0] === r && m[1] === c);
@@ -211,9 +231,10 @@ function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowH
   return (
     <View style={styles.sheet} onLayout={(event) => setWidth(event.nativeEvent.layout.width)}>
       <View style={styles.toolbar}>
-        <ToolButton theme={theme} styles={styles} label={preview ? "페이지 미리 보기" : "기본 보기"} active={preview} onPress={() => setPreview(!preview)} hint="페이지 나누기 미리 보기 전환" />
+        <ToolButton theme={theme} styles={styles} label={lite ? "빠른 검토" : "서식 보기"} onPress={onToggleLite} hint={lite ? "서식 보기로 전환" : "빠른 검토로 전환"} />
+        {lite ? null : <ToolButton theme={theme} styles={styles} label={preview ? "페이지 미리 보기" : "기본 보기"} active={preview} onPress={() => setPreview(!preview)} hint="페이지 나누기 미리 보기 전환" />}
         <ToolButton theme={theme} styles={styles} label={showHidden ? "숨김 표시 중" : hiddenCount > 0 ? `숨김 ${hiddenCount}` : "숨김"} active={showHidden} onPress={() => setShowHidden(!showHidden)} hint="숨긴 행, 열, 시트 표시" />
-        <ToolButton theme={theme} styles={styles} label={slimText ? "새 글자" : "기존 글자"} active={slimText} onPress={() => setSlimText(!slimText)} hint="셀 글자 그리기 방식 전환 (비교용)" />
+        {lite ? null : <ToolButton theme={theme} styles={styles} label={slimText ? "새 글자" : "기존 글자"} active={slimText} onPress={() => setSlimText(!slimText)} hint="셀 글자 그리기 방식 전환 (비교용)" />}
         <View style={styles.spacer} />
         <ToolButton theme={theme} styles={styles} label="−" onPress={() => stepZoom(-1)} hint="축소" />
         <Pressable accessibilityRole="button" accessibilityLabel="화면에 맞추기" onPress={() => setZoom(zoom === null ? fitZoom(layout, width) : null)} style={styles.zoomLabel}>
@@ -226,7 +247,7 @@ function SheetView({ meta, layout, fileKey, theme, compact, showHidden, setShowH
       ) : null}
       {details}
       <View style={{ flex: 1 }}>
-        <Grid file={fileKey} meta={meta} layout={layout} options={options} selected={selected} onSelect={select} onZoomWheel={compact ? undefined : onZoomWheel} bottomClearance={compact && Platform.OS !== "web" ? NATIVE_BOTTOM_CLEARANCE : 0} />
+        <Grid file={fileKey} meta={meta} layout={layout} options={options} selected={selected} onSelect={select} onZoomWheel={compact ? undefined : onZoomWheel} onZoomTo={onZoomTo} bottomClearance={compact && Platform.OS !== "web" ? NATIVE_BOTTOM_CLEARANCE : 0} />
       </View>
     </View>
   );

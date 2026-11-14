@@ -49,7 +49,18 @@ export class Axis {
   }
 }
 
-export function buildAxes(layout: SheetLayout, scale: number, showHidden: boolean) {
+/** Which hidden rows and columns to lay out (shaded) instead of collapsing. */
+export interface Reveal {
+  row(r: number): boolean;
+  col(c: number): boolean;
+}
+
+const REVEAL_ALL: Reveal = { row: () => true, col: () => true };
+const REVEAL_NONE: Reveal = { row: () => false, col: () => false };
+
+/** `rowHeight` lays every row out at that height (hidden rows still collapse) instead of the sheet's own. */
+export function buildAxes(layout: SheetLayout, scale: number, reveal: boolean | Reveal, rowHeight?: number) {
+  const show = reveal === true ? REVEAL_ALL : reveal === false ? REVEAL_NONE : reveal;
   const colRanges = layout.cols;
   const findCol = (c: number): ColRange | undefined => {
     let lo = 0;
@@ -71,7 +82,7 @@ export function buildAxes(layout: SheetLayout, scale: number, showHidden: boolea
     (c) => {
       const col = findCol(c);
       if (!col) return layout.defaultColWidth;
-      if (col.hidden) return showHidden ? col.width || layout.defaultColWidth : 0;
+      if (col.hidden) return show.col(c) ? col.width || layout.defaultColWidth : 0;
       return col.width;
     },
     (c) => findCol(c)?.hidden ?? false,
@@ -81,9 +92,9 @@ export function buildAxes(layout: SheetLayout, scale: number, showHidden: boolea
     layout.rowCount,
     (r) => {
       const row = rowMap.get(r);
-      if (!row) return zeroRows ? (showHidden ? fallbackRow : 0) : layout.defaultRowHeight;
-      if (row.hidden) return showHidden ? row.height || fallbackRow : 0;
-      return row.height;
+      if (!row) return zeroRows ? (show.row(r) ? rowHeight ?? fallbackRow : 0) : rowHeight ?? layout.defaultRowHeight;
+      if (row.hidden) return show.row(r) ? rowHeight ?? (row.height || fallbackRow) : 0;
+      return rowHeight ?? row.height;
     },
     (r) => {
       const row = rowMap.get(r);
@@ -92,6 +103,31 @@ export function buildAxes(layout: SheetLayout, scale: number, showHidden: boolea
     scale,
   );
   return { cols, rows, findCol, rowMap };
+}
+
+/**
+ * Runs of consecutive hidden entries, keyed by their first index, with the run's last index. A run
+ * is what one tap on its marker opens or closes, like a block hidden together in Excel.
+ */
+export function hiddenRuns(hidden: Uint8Array): Map<number, number> {
+  const runs = new Map<number, number>();
+  for (let i = 0; i < hidden.length; i++) {
+    if (!hidden[i]) continue;
+    const start = i;
+    while (i + 1 < hidden.length && hidden[i + 1]) i++;
+    runs.set(start, i);
+  }
+  return runs;
+}
+
+/** Marks every index of the opened runs. */
+export function openedMask(count: number, runs: Map<number, number>, opened: ReadonlySet<number>): Uint8Array {
+  const mask = new Uint8Array(count);
+  for (const start of opened) {
+    const end = runs.get(start);
+    if (end !== undefined) mask.fill(1, start, end + 1);
+  }
+  return mask;
 }
 
 export interface Window {
